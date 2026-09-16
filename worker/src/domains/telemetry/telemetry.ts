@@ -45,14 +45,21 @@ telemetry.post('/', async (c) => {
   const deviceKey = normaliseDeviceKey(c.req.header('x-nodrix-device'));
   const device = await resolveDevice(c.env, project_id, deviceKey, now);
 
+  const effectivePoints: IngestPoint[] = points.map((p) => {
+    if (deviceKey && !p.variable.toLowerCase().endsWith(`_${deviceKey.toLowerCase()}`)) {
+      return { variable: `${p.variable}_${deviceKey}`, value: p.value };
+    }
+    return p;
+  });
+
   const stub = projectStub(c.env, project_id);
-  await stub.ingest(project_id, points, device?.storageId ?? '');
+  await stub.ingest(project_id, effectivePoints, device?.storageId ?? '');
 
   // Auto-create new variables + bump last_seen off the response path (best-effort).
   if (device) {
     c.executionCtx.waitUntil(
       Promise.all([
-        upsertVariables(c.env, project_id, device.id, points.map((p) => p.variable), now),
+        upsertVariables(c.env, project_id, device.id, effectivePoints.map((p) => p.variable), now),
         touchDevice(c.env, device.id),
       ])
     );
