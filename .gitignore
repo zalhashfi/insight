@@ -13,3 +13,4 @@ worker/src/version.gen.ts
 web/dist/
 bun.lockb
 bun.lock
+/wrangler.toml
