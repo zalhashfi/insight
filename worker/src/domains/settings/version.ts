@@ -16,7 +16,7 @@ const version = new Hono<{ Bindings: Env; Variables: UserContextVars }>();
 
 version.use('*', requireSession);
 
-const DEFAULT_UPSTREAM = 'decoded-cipher/nodrix';
+const DEFAULT_UPSTREAM = 'zalhashfi/nodrix';
 // Branch tracked on the edge channel (the project's default branch).
 const DEFAULT_BRANCH = 'master';
 // Cache is served as-is for FRESH seconds; the entry (with its ETag) is kept in

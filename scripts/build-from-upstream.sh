@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-UPSTREAM_REPO="${NODRIX_UPSTREAM_REPO:-decoded-cipher/nodrix}"
+UPSTREAM_REPO="${NODRIX_UPSTREAM_REPO:-zalhashfi/nodrix}"
 DEPLOY_CHANNEL="${NODRIX_DEPLOY_CHANNEL:-release}"
 UPSTREAM_DIR="/tmp/nodrix-upstream"
 WRANGLER_BACKUP="/tmp/nodrix-wrangler.toml"

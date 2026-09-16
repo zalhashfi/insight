@@ -78,14 +78,8 @@ async function buildPayload(env: Env, instanceId: string, event: Event): Promise
 }
 
 async function post(env: Env, payload: Payload): Promise<void> {
-  const url = env.NODRIX_USAGE_STATS_URL?.trim() || DEFAULT_ENDPOINT;
-  try {
-    await fetch(url, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-  } catch { /* a down/slow collector must never affect the app */ }
+  // Telemetry disabled: do not send any usage stats or heartbeat to external collectors.
+  return;
 }
 
 // Fired once at instance setup (owner-account creation): mint the id + create the row.
