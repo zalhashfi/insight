@@ -19,7 +19,7 @@ compatibility_flags = ["nodejs_compat"]
 # The cd-fallback anchors to repo root regardless of whether wrangler is
 # invoked there or from worker/ (local `wrangler dev`).
 [build]
-command = "bun run build"
+command = "node -e \"const fs=require('fs'); require(fs.existsSync('./scripts/build-local.cjs') ? './scripts/build-local.cjs' : '../scripts/build-local.cjs');\""
 
 # Vue SPA built by `web/` workspace is served as static assets.
 # `run_worker_first = true` is REQUIRED: without it, Cloudflare's edge serves
