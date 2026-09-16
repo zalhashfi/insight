@@ -11,7 +11,6 @@ import { IotPushElement } from './iot-push/widget';
 import { IotSliderElement } from './iot-slider/widget';
 import { IotColorElement } from './iot-color/widget';
 import { IotPercentElement } from './iot-percent/widget';
-import { IotApiElement } from './iot-api/widget';
 
 let registered = false;
 
@@ -27,5 +26,4 @@ export function registerWidgets(): void {
   if (!customElements.get('iot-slider')) customElements.define('iot-slider', IotSliderElement);
   if (!customElements.get('iot-color')) customElements.define('iot-color', IotColorElement);
   if (!customElements.get('iot-percent')) customElements.define('iot-percent', IotPercentElement);
-  if (!customElements.get('iot-api')) customElements.define('iot-api', IotApiElement);
 }

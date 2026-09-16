@@ -42,13 +42,3 @@ test('variablesFromLayout extracts the variables a layout references (leak-filte
   expect(r.ok).toBe(true);
   if (r.ok) expect(new Set(variablesFromLayout(r.value))).toEqual(new Set(['temperature', 'humidity']));
 });
-
-test('accepts layout containing iot-api widget and extracts no variables', () => {
-  const apiWidget = {
-    id: 'w_api', x: 0, y: 0, w: 5, h: 3, type: 'iot-api',
-    props: { title: 'BTC', url: 'https://api.coingecko.com/test', path: 'bitcoin.usd', unit: 'USD', interval: 15 },
-  };
-  const r = validateLayout({ grid: { columns: 12 }, items: [apiWidget] });
-  expect(r.ok).toBe(true);
-  if (r.ok) expect(variablesFromLayout(r.value)).toEqual([]);
-});
