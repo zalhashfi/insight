@@ -10,6 +10,7 @@ import iotPush from './iot-push/manifest.json';
 import iotSlider from './iot-slider/manifest.json';
 import iotColor from './iot-color/manifest.json';
 import iotPercent from './iot-percent/manifest.json';
+import iotApi from './iot-api/manifest.json';
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 // Loose on purpose — runtime data shape matches what the manifests declare.
@@ -69,7 +70,7 @@ export type WidgetManifest = {
 
 // ─── Catalog ────────────────────────────────────────────────────────────────
 
-const RAW = [iotValue, iotGauge, iotChart, iotMap, iotToggle, iotPush, iotSlider, iotColor, iotPercent] as const;
+const RAW = [iotValue, iotGauge, iotChart, iotMap, iotToggle, iotPush, iotSlider, iotColor, iotPercent, iotApi] as const;
 
 export type WidgetType = (typeof RAW)[number]['id'];
 

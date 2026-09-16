@@ -1,0 +1,62 @@
+{
+  "id": "iot-api",
+  "label": "External API",
+  "description": "Periodically fetches and displays live values from an external REST/JSON API.",
+  "category": "Monitor",
+  "dataTypes": ["Numeric", "String", "JSON"],
+  "usage": "Display a value from any external REST/JSON API URL directly on the dashboard.",
+  "icon": "<svg viewBox=\"0 0 24 24\" fill=\"none\" stroke=\"currentColor\" stroke-width=\"1.75\" stroke-linecap=\"round\" stroke-linejoin=\"round\"><circle cx=\"12\" cy=\"12\" r=\"10\"/><path d=\"M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20\"/><path d=\"M2 12h20\"/></svg>",
+
+  "defaultSize": { "w": 5, "h": 3 },
+  "minSize": { "w": 3, "h": 2 },
+  "defaultProps": {
+    "title": "External API",
+    "url": "",
+    "path": "",
+    "unit": "",
+    "interval": 15,
+    "headers": ""
+  },
+
+  "fields": [
+    { "key": "title", "label": "Title", "type": "string", "placeholder": "e.g. Bitcoin Price" },
+    { "key": "url", "label": "API URL", "type": "string", "placeholder": "https://api.example.com/data" },
+    { "key": "path", "label": "JSON Field / Path", "type": "string", "placeholder": "e.g. bitcoin.usd or data[0].val" },
+    { "key": "unit", "label": "Unit", "type": "string", "placeholder": "e.g. USD, °C, ms" },
+    { "key": "interval", "label": "Refresh (seconds)", "type": "number", "placeholder": "15", "default": 15, "suffix": "s" },
+    { "key": "headers", "label": "Custom Headers (JSON, optional)", "type": "string", "placeholder": "{\"Authorization\": \"Bearer ...\"}" }
+  ],
+
+  "bindings": {
+    "attributes": [
+      { "prop": "title", "type": "string" },
+      { "prop": "url", "type": "string" },
+      { "prop": "path", "type": "string" },
+      { "prop": "unit", "type": "string" },
+      { "prop": "interval", "type": "number" },
+      { "prop": "headers", "type": "string" }
+    ],
+    "properties": []
+  },
+
+  "runtime": {
+    "variableExtractor": { "kind": "none" },
+    "liveUpdate": { "kind": "none" },
+    "snapshot": { "kind": "none" }
+  },
+
+  "quirks": {
+    "mobile": { "paired": true }
+  },
+
+  "mcp": {
+    "description": "Periodically fetches and displays live values from an external REST/JSON API.",
+    "propTypes": {
+      "title": "string",
+      "url": "string (API endpoint URL)",
+      "path": "string (JSON dot path)",
+      "unit": "string",
+      "interval": "number (seconds)"
+    }
+  }
+}

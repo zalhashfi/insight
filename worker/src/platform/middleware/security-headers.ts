@@ -7,7 +7,7 @@ const CSP_COMMON =
   "default-src 'self'; base-uri 'self'; object-src 'none'; " +
   'img-src \'self\' data: blob: https:; font-src \'self\' data: https://fonts.gstatic.com; ' +
   "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; script-src 'self' 'unsafe-inline'; " +
-  "connect-src 'self' https: wss:; worker-src 'self' blob:; " +
+  "connect-src 'self' https: http: wss:; worker-src 'self' blob:; " +
   'manifest-src \'self\'';
 
 // form-action is enforced across the redirect chain; /authorize must allow
