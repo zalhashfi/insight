@@ -37,7 +37,7 @@ function scriptNameFromHost(host: string): string {
     const label = host.slice(0, host.indexOf('.'));
     if (label) return label;
   }
-  return 'nodrix';
+  return 'insight';
 }
 
 // Strip a leading "v" so "v0.9.0" and "0.9.0" compare equal.
@@ -104,7 +104,7 @@ async function fetchUpstream(repo: string, etag?: string | null): Promise<FetchR
   // GitHub requires a User-Agent. If-None-Match makes GitHub answer 304 when
   // nothing changed since our last fetch.
   const headers: Record<string, string> = {
-    'User-Agent': 'nodrix-update-check',
+    'User-Agent': 'insight-update-check',
     Accept: 'application/vnd.github+json',
   };
   if (etag) headers['If-None-Match'] = etag;

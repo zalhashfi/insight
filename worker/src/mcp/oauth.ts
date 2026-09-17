@@ -49,7 +49,7 @@ function b64decode(s: string): string {
 
 // GET /authorize — render the consent screen (or bounce to login).
 oauth.get('/', async (c) => {
-  if (!(await mcpEnabled(c.env))) return errorResponse(c, 404, 'MCP server is off', "The owner hasn't enabled MCP connections for this nodrix.");
+  if (!(await mcpEnabled(c.env))) return errorResponse(c, 404, 'MCP server is off', "The owner hasn't enabled MCP connections for this INSIGHT.");
 
   let authReq: AuthRequest;
   try {
@@ -287,7 +287,7 @@ function consentPage(o: {
 <form class="card" method="post" action="/authorize/consent">
   <div class="header">
     <h1>Connect <span style="color:var(--accent)">${esc(o.clientName)}</span></h1>
-    <div class="muted">to your nodrix data, as <span class="strong">${esc(o.email)}</span>.</div>
+    <div class="muted">to your INSIGHT data, as <span class="strong">${esc(o.email)}</span>.</div>
     <div class="who">redirects to <code>${esc(o.redirectHost)}</code></div>
   </div>
 
@@ -320,7 +320,7 @@ function errorPage(o: { title: string; body: string }): string {
   <h1>${esc(o.title)}</h1>
   <div class="muted">${esc(o.body)}</div>
   <div class="err-actions">
-    <a class="btn btn-ghost" href="/" style="text-decoration:none;display:inline-block;">Back to nodrix</a>
+    <a class="btn btn-ghost" href="/" style="text-decoration:none;display:inline-block;">Back to INSIGHT</a>
   </div>
 </div>
 <style>${extraStyles}</style>`;

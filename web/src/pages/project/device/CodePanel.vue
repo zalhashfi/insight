@@ -12,17 +12,17 @@ import { runBuild } from '../../../composables/useAgentBuild';
 
 const project = useProjectStore();
 
-const STARTER = `#include <Nodrix.h>
+const STARTER = `#include <Insight.h>
 
 void setup() {
   Serial.begin(115200);
-  Nodrix.setDebug(true);
-  Nodrix.addAP("your-wifi", "your-password");
-  Nodrix.begin("your-instance.workers.dev", "your-connection-token");
+  Insight.setDebug(true);
+  Insight.addAP("your-wifi", "your-password");
+  Insight.begin("your-instance.workers.dev", "your-connection-token");
 }
 
 void loop() {
-  Nodrix.run();
+  Insight.run();
 }
 `;
 

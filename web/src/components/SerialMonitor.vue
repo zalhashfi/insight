@@ -146,7 +146,7 @@ function stamp(at: number) {
       @scroll="onScroll"
     >
       <p v-if="!entries.length" class="text-neutral-500">
-        Connect a board to see what it's printing. Call <code>Nodrix.setDebug(true)</code> in your sketch
+        Connect a board to see what it's printing. Call <code>INSIGHT.setDebug(true)</code> in your sketch
         for connection details.
       </p>
       <div v-for="e in entries" :key="e.id" class="flex gap-2 whitespace-pre-wrap break-all">
