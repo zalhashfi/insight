@@ -73,6 +73,13 @@ const projectScoped = computed<NavItem[]>(() => {
       // Stay highlighted across the Connections tab and the editor too.
       matchPath: (path) => path.startsWith(`/p/${id}/automations`),
     },
+    {
+      label: 'API External',
+      to: `/p/${id}/external`,
+      icon: 'integrations',
+      disabled: !hasProject.value,
+      matchPath: (path) => path.startsWith(`/p/${id}/external`),
+    },
   ];
 });
 

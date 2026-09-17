@@ -16,6 +16,8 @@ import type {
   Integration,
   IntegrationKind,
   IntegrationTestResult,
+  ExternalSource,
+  ExternalSourcePreview,
   Layout,
   ShareState,
   UserToken,
@@ -31,6 +33,7 @@ export const useProjectStore = defineStore('project', () => {
   const tokens = ref<UserToken[]>([]);
   const automations = ref<Automation[]>([]);
   const integrations = ref<Integration[]>([]);
+  const externalSources = ref<ExternalSource[]>([]);
   // Transient draft for a not-yet-saved automation: the create modal sets its
   // name/description, the editor builds the graph, and nothing persists until Save.
   const pendingAutomation = ref<{ name: string; description: string | null } | null>(null);
@@ -45,6 +48,7 @@ export const useProjectStore = defineStore('project', () => {
     if (currentProjectId.value !== projectId) {
       automations.value = [];
       integrations.value = [];
+      externalSources.value = [];
       projectTokens.value = [];
       devices.value = [];
       firmware.value = [];
@@ -452,6 +456,88 @@ export const useProjectStore = defineStore('project', () => {
     return res;
   }
 
+  // ─── External sources ─────────────────────────────────────────────────────
+
+  async function loadExternalSources(): Promise<void> {
+    if (!currentProjectId.value) return;
+    const data = await api.get<{ external_sources: ExternalSource[] }>(
+      `/v1/admin/projects/${currentProjectId.value}/external-sources`
+    );
+    externalSources.value = data.external_sources;
+  }
+
+  async function createExternalSource(input: {
+    name: string;
+    url: string;
+    device_key: string;
+    interval_minutes: ExternalSource['interval_minutes'];
+    envelope_path?: string;
+    fields: string[];
+    cursor_field?: string;
+    sentinel_map?: Record<string, Array<number | string>>;
+    headers?: Record<string, string>;
+    enabled?: boolean;
+  }): Promise<ExternalSource> {
+    const pid = requireProjectId();
+    const s = await api.post<{ external_source: ExternalSource }>(
+      `/v1/admin/projects/${pid}/external-sources`,
+      input
+    );
+    externalSources.value = [s.external_source, ...externalSources.value];
+    return s.external_source;
+  }
+
+  async function updateExternalSource(
+    id: string,
+    patch: Partial<Pick<ExternalSource, 'name' | 'url' | 'device_key' | 'interval_minutes' | 'envelope_path' | 'fields' | 'cursor_field' | 'sentinel_map' | 'enabled'> & { headers?: Record<string, string> }>
+  ): Promise<ExternalSource> {
+    const pid = requireProjectId();
+    const s = await api.patch<{ external_source: ExternalSource }>(
+      `/v1/admin/projects/${pid}/external-sources/${id}`,
+      patch
+    );
+    externalSources.value = externalSources.value.map((x) => (x.id === id ? s.external_source : x));
+    return s.external_source;
+  }
+
+  async function deleteExternalSource(id: string): Promise<void> {
+    if (!currentProjectId.value) return;
+    await api.del<void>(`/v1/admin/projects/${currentProjectId.value}/external-sources/${id}`);
+    externalSources.value = externalSources.value.filter((s) => s.id !== id);
+  }
+
+  async function previewExternalSource(input: {
+    url: string;
+    envelope_path?: string;
+    headers?: Record<string, string>;
+    sentinel_map?: Record<string, Array<number | string>>;
+  }): Promise<ExternalSourcePreview> {
+    const pid = requireProjectId();
+    const res = await api.post<{ preview: ExternalSourcePreview }>(
+      `/v1/admin/projects/${pid}/external-sources/preview`,
+      input
+    );
+    return res.preview;
+  }
+
+  async function testExternalSource(id: string): Promise<{ status: string; detail?: string; points?: number }> {
+    const pid = requireProjectId();
+    const res = await api.post<{ result: { status: string; detail?: string; points?: number } }>(
+      `/v1/admin/projects/${pid}/external-sources/${id}/test`
+    );
+    await loadExternalSources();
+    return res.result;
+  }
+
+  async function runExternalSourceNow(id: string): Promise<{ status: string; detail?: string; points?: number }> {
+    const pid = requireProjectId();
+    const res = await api.post<{ result: { status: string; detail?: string; points?: number } }>(
+      `/v1/admin/projects/${pid}/external-sources/${id}/run`
+    );
+    await loadExternalSources();
+    return res.result;
+  }
+
   return {
     currentProjectId,
     variables,
@@ -462,6 +548,7 @@ export const useProjectStore = defineStore('project', () => {
     tokens,
     automations,
     integrations,
+    externalSources,
     pendingAutomation,
     switchTo,
     loadDevices,
@@ -500,5 +587,12 @@ export const useProjectStore = defineStore('project', () => {
     updateIntegration,
     deleteIntegration,
     testIntegration,
+    loadExternalSources,
+    createExternalSource,
+    updateExternalSource,
+    deleteExternalSource,
+    previewExternalSource,
+    testExternalSource,
+    runExternalSourceNow,
   };
 });

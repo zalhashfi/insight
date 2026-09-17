@@ -68,5 +68,13 @@ export const MIGRATIONS: Migration[] = [
       "ALTER TABLE devices ADD COLUMN ota_status TEXT",
       "ALTER TABLE devices ADD COLUMN ota_updated_at INTEGER"
     ]
+  },
+  {
+    "name": "0003_external_sources",
+    "statements": [
+      "CREATE TABLE IF NOT EXISTS external_sources (\n  id TEXT PRIMARY KEY,\n  project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,\n  name TEXT NOT NULL,\n  url TEXT NOT NULL,\n  device_key TEXT NOT NULL,\n  interval_minutes INTEGER NOT NULL DEFAULT 5,\n  envelope_path TEXT NOT NULL DEFAULT '',\n  fields TEXT NOT NULL DEFAULT '[]',\n  cursor_field TEXT NOT NULL DEFAULT 'id',\n  sentinel_map TEXT NOT NULL DEFAULT '{}',\n  headers TEXT NOT NULL DEFAULT '',\n  enabled INTEGER NOT NULL DEFAULT 1,\n  last_cursor TEXT,\n  last_run_at INTEGER,\n  last_run_status TEXT CHECK (last_run_status IN ('ok','error','skipped')),\n  last_error TEXT,\n  created_by TEXT REFERENCES users(id),\n  created_at INTEGER NOT NULL,\n  updated_at INTEGER NOT NULL,\n  archived_at INTEGER\n)",
+      "CREATE INDEX IF NOT EXISTS idx_external_sources_project ON external_sources(project_id)",
+      "CREATE INDEX IF NOT EXISTS idx_external_sources_poll ON external_sources(enabled, archived_at)"
+    ]
   }
 ];

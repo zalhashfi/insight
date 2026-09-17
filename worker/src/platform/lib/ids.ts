@@ -20,6 +20,7 @@ const PREFIXES = {
   control: 'ctl',
   automation: 'aut',
   integration: 'itg',
+  external: 'ext',
   widget: 'wid',
   delay: 'dly',
   device: 'dev',

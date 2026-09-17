@@ -1,6 +1,7 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { Env } from '../../env';
 import { computeNextScheduled, runScheduledDue, runDueDelays, nextDelayFireAt, type SchedulePlan } from '../engine/schedule';
+import { computeNextExternalPoll, runDueExternalPolls, type ExternalPollPlan } from '../engine/external-poll';
 
 // Singleton scheduler. Holds ONE alarm set to the next schedule/sunset fire time
 // OR the next pending delay resume, whichever is sooner; on wake it runs whatever
@@ -15,12 +16,18 @@ export class SchedulerDO extends DurableObject<Env> {
   async reschedule(): Promise<void> {
     const plan = await computeNextScheduled(this.env);
     const delayAt = await nextDelayFireAt(this.env);
+    const extPlan = await computeNextExternalPoll(this.env).catch((e) => {
+      console.error('[scheduler] external poll plan failed', e);
+      return { fireAt: null, due: [] } satisfies ExternalPollPlan;
+    });
     await this.ctx.storage.put('plan', plan);
+    await this.ctx.storage.put('extPlan', extPlan);
 
-    const fireAt = soonest(plan.fireAt, delayAt);
+    const fireAt = soonest(plan.fireAt, delayAt, extPlan.fireAt);
     if (fireAt == null) {
       await this.ctx.storage.deleteAlarm();
       await this.ctx.storage.delete('plan');
+      await this.ctx.storage.delete('extPlan');
       return;
     }
     await this.ctx.storage.setAlarm(fireAt);
@@ -43,14 +50,23 @@ export class SchedulerDO extends DurableObject<Env> {
 
   override async alarm(): Promise<void> {
     const now = Date.now();
-    // The alarm may have fired for a schedule or a delay (or both at once). Run
-    // schedule fires only when their planned instant has actually arrived.
+    // The alarm may have fired for a schedule, a delay, or an external poll
+    // (or all at once). Run schedule fires only when their planned instant has
+    // actually arrived.
     const plan = await this.ctx.storage.get<SchedulePlan>('plan');
     if (plan?.fireAt != null && plan.fireAt <= now) {
       try {
         await runScheduledDue(this.env, plan.due, Math.floor(plan.fireAt / 1000));
       } catch (e) {
         console.error('[scheduler] run failed', e);
+      }
+    }
+    const extPlan = await this.ctx.storage.get<ExternalPollPlan>('extPlan');
+    if (extPlan?.fireAt != null && extPlan.fireAt <= now) {
+      try {
+        await runDueExternalPolls(this.env, extPlan.due);
+      } catch (e) {
+        console.error('[scheduler] external poll failed', e);
       }
     }
     try {
@@ -62,11 +78,14 @@ export class SchedulerDO extends DurableObject<Env> {
   }
 }
 
-// Smaller of two optional epochs.
-function soonest(a: number | null, b: number | null): number | null {
-  if (a == null) return b;
-  if (b == null) return a;
-  return Math.min(a, b);
+// Smallest of three optional epochs.
+function soonest(a: number | null, b: number | null, c: number | null = null): number | null {
+  let best: number | null = null;
+  for (const v of [a, b, c]) {
+    if (v == null) continue;
+    if (best == null || v < best) best = v;
+  }
+  return best;
 }
 
 const NAME = 'scheduler';

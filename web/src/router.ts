@@ -62,6 +62,7 @@ const routes: RouteRecordRaw[] = [
               { path: 'connections', redirect: (to) => `/p/${to.params['proj'] as string}/automations/integrations` },
             ],
           },
+          { path: 'external', name: 'external-sources', component: () => import('./pages/project/external/ExternalSources.vue'), meta: { title: 'API External' } },
           // Full-width editor, a sibling of the hub so it isn't constrained by the tab shell.
           { path: 'automations/editor/:id?', name: 'automation-editor', component: () => import('./pages/project/automations/AutomationEditor.vue'), meta: { title: 'Automation editor' } },
           // Back-compat for the old standalone Integrations route/bookmarks.

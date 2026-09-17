@@ -29,6 +29,7 @@ import { serveDashboardSeo } from './domains/dashboards/seo';
 import ws from './domains/dashboards/ws';
 import automations from './domains/automations/routes';
 import integrations from './domains/integrations/routes';
+import externalSources from './domains/external-sources/routes';
 
 // telemetry (device ingress)
 import telemetry from './domains/telemetry/telemetry';
@@ -80,6 +81,7 @@ export function registerRoutes(app: App): void {
   app.route('/v1/admin/projects/:proj/dashboards', dashboards);
   app.route('/v1/admin/projects/:proj/automations', automations);
   app.route('/v1/admin/projects/:proj/integrations', integrations);
+  app.route('/v1/admin/projects/:proj/external-sources', externalSources);
   app.route('/v1/admin/tokens', tokens);
   app.route('/v1/admin/audit-log', auditLog);
 

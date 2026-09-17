@@ -258,6 +258,42 @@ export type Automation = {
 export type { IntegrationKind, Integration } from '@insight/integrations-shared';
 export type { IntegrationResult as IntegrationTestResult } from '@insight/integrations-shared';
 
+export type ExternalSource = {
+  id: string;
+  project_id: string;
+  name: string;
+  url: string;
+  device_key: string;
+  interval_minutes: 2 | 5 | 15 | 30 | 60;
+  envelope_path: string;
+  fields: string[];
+  cursor_field: string;
+  sentinel_map: Record<string, Array<number | string>>;
+  headers_present: boolean;
+  enabled: boolean;
+  last_cursor: string | null;
+  last_run_at: number | null;
+  last_run_status: 'ok' | 'error' | 'skipped' | null;
+  last_error: string | null;
+  created_at: number;
+  updated_at: number;
+};
+
+export type ExternalSourceField = {
+  key: string;
+  kinds: Array<'number' | 'string' | 'boolean' | 'null'>;
+  nullable: boolean;
+  sample: unknown;
+  invalid: boolean;
+};
+
+export type ExternalSourcePreview = {
+  total: number;
+  records: Record<string, unknown>[];
+  fields: ExternalSourceField[];
+  suggested_cursor: string;
+};
+
 export type AuditLogEntry = {
   id: number;
   project_id: string | null;

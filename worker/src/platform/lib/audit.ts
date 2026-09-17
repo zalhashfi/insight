@@ -28,6 +28,7 @@ export type AuditTargetType =
   | 'token'
   | 'automation'
   | 'integration'
+  | 'external_source'
   | 'user'
   | 'session'
   | 'deployment';
