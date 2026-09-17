@@ -31,7 +31,7 @@ bucket_name = "home-iot-telemetry"
 NODRIX_UPSTREAM_REPO = "someone/nodrix-fork"
 `;
 
-const TEMPLATE = `name = "nodrix"
+const TEMPLATE = `name = "insight"
 main = "worker/src/index.ts"
 compatibility_date = "2026-01-15"
 compatibility_flags = ["nodejs_compat"]
@@ -62,7 +62,7 @@ tag = "v2"
 new_sqlite_classes = ["DeviceDO"]
 
 [vars]
-NODRIX_UPSTREAM_REPO = "decoded-cipher/nodrix"
+INSIGHT_UPSTREAM_REPO = "zalhashfi/insight"
 NODRIX_FEATURE_FLAG = "on"
 
 [triggers]
@@ -73,7 +73,7 @@ const merged = mergeWrangler(DEPLOYMENT, TEMPLATE);
 
 test('keeps the deployment worker name', () => {
   expect(merged).toContain('name = "home-iot"');
-  expect(merged).not.toContain('name = "nodrix"');
+  expect(merged).not.toContain('name = "insight"');
 });
 
 test('keeps resource ids the deployment owns', () => {

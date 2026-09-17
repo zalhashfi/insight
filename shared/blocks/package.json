@@ -1,5 +1,5 @@
 {
-  "name": "@nodrix/blocks-shared",
+  "name": "@insight/blocks-shared",
   "private": true,
   "version": "0.0.0",
   "type": "module",
@@ -7,6 +7,6 @@
     ".": "./index.ts"
   },
   "dependencies": {
-    "@nodrix/integrations-shared": "*"
+    "@insight/integrations-shared": "*"
   }
 }

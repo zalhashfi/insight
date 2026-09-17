@@ -1,11 +1,11 @@
-// Execution lives in @nodrix/integrations-shared; re-exported here. The
+// Execution lives in @insight/integrations-shared; re-exported here. The
 // D1-touching `recordIntegrationRun` stays in the worker (it writes env.DB).
 
 import type { Env } from '../../env';
-import type { IntegrationResult } from '@nodrix/integrations-shared';
+import type { IntegrationResult } from '@insight/integrations-shared';
 
-export { executeIntegration } from '@nodrix/integrations-shared/runtime';
-export type { IntegrationResult } from '@nodrix/integrations-shared';
+export { executeIntegration } from '@insight/integrations-shared/runtime';
+export type { IntegrationResult } from '@insight/integrations-shared';
 
 // Stamps the outcome of a delivery onto the integration row so the UI can show
 // "last delivered / last error" per connection. Best-effort: failures here must

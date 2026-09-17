@@ -123,7 +123,7 @@ const mcpSaving = ref(false);
 const mcpUrl = computed(() => `${window.location.origin}/v1/mcp`);
 const mcpOAuthUrl = computed(() => `${window.location.origin}/v1/mcp/oauth`);
 const mcpConnectSnippet = computed(
-  () => `claude mcp add --transport http nodrix ${mcpUrl.value} \\\n  --header "Authorization: Bearer <your token>"`
+  () => `claude mcp add --transport http insight ${mcpUrl.value} \\\n  --header "Authorization: Bearer <your token>"`
 );
 
 async function toggleMcp(next: boolean) {
@@ -164,6 +164,27 @@ async function toggleMcpWrite(next: boolean) {
     toast.error((e as Error).message);
   } finally {
     mcpWriteSaving.value = false;
+  }
+}
+
+// ─── Build agent repo (owner-only) ────────────────────────────────────────────
+// Which GitHub repo the Code page offers the agent binary from. Empty means the
+// deployment falls back to its plaintext var or the built-in default.
+const agentRepo = ref('');
+const agentRepoSaving = ref(false);
+
+async function saveAgentRepo() {
+  agentRepoSaving.value = true;
+  try {
+    const res = await api.put<{ agent_repo: string }>('/v1/admin/settings/agent-repo', {
+      repo: agentRepo.value.trim() || null,
+    });
+    agentRepo.value = res.agent_repo;
+    toast.success('Agent repository saved');
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    agentRepoSaving.value = false;
   }
 }
 
@@ -295,10 +316,16 @@ onMounted(async () => {
       providers.value = [];
     }
     try {
-      const s = await api.get<{ audit_log_enabled: boolean; mcp_enabled: boolean; mcp_write_enabled: boolean }>('/v1/admin/settings');
+      const s = await api.get<{
+        audit_log_enabled: boolean;
+        mcp_enabled: boolean;
+        mcp_write_enabled: boolean;
+        agent_repo: string;
+      }>('/v1/admin/settings');
       auditLogEnabled.value = s.audit_log_enabled;
       mcpEnabled.value = s.mcp_enabled;
       mcpWriteEnabled.value = s.mcp_write_enabled;
+      agentRepo.value = s.agent_repo;
     } catch { /* ignore */ }
     await refreshVersion();
   }
@@ -765,6 +792,43 @@ const PROVIDER_META = {
 
         <div class="border-t border-neutral-100 pt-3 text-[11px] text-neutral-500 dark:border-neutral-800 dark:text-neutral-400">
           Tracking upstream <span class="font-mono">{{ versionInfo?.upstream_repo ?? '…' }}</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Build agent repo (owner-only) -->
+    <section v-if="isOwner" class="mb-6 overflow-hidden rounded-lg border border-neutral-200 bg-white dark:border-neutral-800 dark:bg-neutral-900">
+      <div class="px-4 py-3">
+        <div class="flex items-start gap-3">
+          <div class="mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg bg-accent-100 text-accent-600 dark:bg-accent-500/15 dark:text-accent-400">
+            <svg class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="m16 18 6-6-6-6" /><path d="m8 6-6 6 6 6" />
+            </svg>
+          </div>
+          <div class="min-w-0 flex-1">
+            <div class="text-sm font-semibold">Build agent repository</div>
+            <div class="mt-0.5 text-xs text-neutral-500 dark:text-neutral-400">
+              The <span class="font-mono">owner/name</span> repo the Code page downloads the build
+              agent from. It compiles sketches on your machine; nothing is downloaded from anywhere
+              else. Leave empty to use this deployment's default.
+            </div>
+            <div class="mt-2 flex flex-wrap items-center gap-2">
+              <input
+                v-model="agentRepo"
+                type="text"
+                spellcheck="false"
+                placeholder="owner/name"
+                class="min-w-0 flex-1 rounded-md border border-neutral-300 bg-white px-3 py-1.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950"
+                @keyup.enter="saveAgentRepo"
+              />
+              <button
+                type="button"
+                :disabled="agentRepoSaving"
+                class="shrink-0 rounded-md bg-accent-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-accent-700 disabled:opacity-50"
+                @click="saveAgentRepo"
+              >{{ agentRepoSaving ? 'Saving…' : 'Save' }}</button>
+            </div>
+          </div>
         </div>
       </div>
     </section>

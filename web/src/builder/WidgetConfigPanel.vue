@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, provide } from 'vue';
-import { manifestFor as specFor, type WidgetField } from '@nodrix/widgets-shared';
+import { manifestFor as specFor, type WidgetField } from '@insight/widgets-shared';
 import { useProjectStore } from '../stores/project';
 import ConfigField from './ConfigField.vue';
 import type { WidgetInstance } from '../types';

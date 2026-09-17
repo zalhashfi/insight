@@ -3,7 +3,7 @@
 # deployment's wrangler.toml from this file, keeping only its Worker name,
 # account, routes, resource IDs and vars. Everything else here reaches every
 # existing deployment on its next build — keep it in sync with the root config.
-name = "nodrix"
+name = "insight"
 main = "worker/src/index.ts"
 compatibility_date = "2025-05-01"
 compatibility_flags = ["nodejs_compat"]
@@ -11,7 +11,7 @@ compatibility_flags = ["nodejs_compat"]
 # Pulls the latest nodrix release and builds it over this clone.
 # Set NODRIX_DEPLOY_CHANNEL=edge in build vars to track the default branch.
 [build]
-command = "curl -fsSL https://raw.githubusercontent.com/zalhashfi/nodrix/master/scripts/build-from-upstream.sh | bash"
+command = "curl -fsSL https://raw.githubusercontent.com/zalhashfi/insight/master/scripts/build-from-upstream.sh | bash"
 
 # run_worker_first is required: without it the SPA fallback serves index.html for
 # unmatched GETs before the Worker runs, swallowing OAuth callbacks.
@@ -23,13 +23,13 @@ run_worker_first = true
 
 [[d1_databases]]
 binding = "DB"
-database_name = "nodrix"
+database_name = "insight-db"
 database_id = "PLACEHOLDER_FILLED_BY_DEPLOY_OR_WRANGLER"
 migrations_dir = "worker/src/platform/db/migrations"
 
 [[r2_buckets]]
 binding = "R2"
-bucket_name = "nodrix-telemetry"
+bucket_name = "insight-telemetry"
 
 [[kv_namespaces]]
 binding = "KV"
@@ -49,20 +49,21 @@ class_name = "SchedulerDO"
 
 [[durable_objects.bindings]]
 name = "MCP_OBJECT"
-class_name = "NodrixMcpAgent"
+class_name = "InsightMcpAgent"
 
 [[migrations]]
 tag = "v1"
-new_sqlite_classes = ["ProjectDO", "DashboardDO", "SchedulerDO", "NodrixMcpAgent"]
+new_sqlite_classes = ["ProjectDO", "DashboardDO", "SchedulerDO", "InsightMcpAgent"]
 
 [[workflows]]
-name = "nodrix-provision"
+name = "insight-provision"
 binding = "PROVISION"
 class_name = "Provision"
 
 # Polled by Settings → Version & updates to flag new releases. Override for forks.
 [vars]
-NODRIX_UPSTREAM_REPO = "zalhashfi/nodrix"
+INSIGHT_UPSTREAM_REPO = "zalhashfi/insight"
+INSIGHT_AGENT_REPO = "zalhashfi/insight-agent"
 
 # Daily anonymous usage-stats heartbeat disabled.
 # [triggers]

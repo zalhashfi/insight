@@ -4,7 +4,7 @@
 
 import { GRID_COLUMNS } from './grid';
 import type { Layout, MobilePlacement, WidgetInstance } from '../types';
-import { manifestFor, type WidgetType } from '@nodrix/widgets-shared';
+import { manifestFor, type WidgetType } from '@insight/widgets-shared';
 
 const HALF = GRID_COLUMNS / 2;
 

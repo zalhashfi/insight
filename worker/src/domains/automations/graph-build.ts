@@ -6,9 +6,9 @@
 import {
   triggerNodes, actionNodes, serializeTriggerKinds,
   type AutomationGraph,
-} from '@nodrix/blocks-shared';
+} from '@insight/blocks-shared';
 
-export { buildLinearGraph, isGraph, graphError, type AutomationGraph } from '@nodrix/blocks-shared';
+export { buildLinearGraph, isGraph, graphError, type AutomationGraph } from '@insight/blocks-shared';
 
 export function graphColumns(graph: AutomationGraph): {
   graph: string;

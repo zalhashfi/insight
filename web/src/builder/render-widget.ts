@@ -5,8 +5,8 @@
 // Widget contract: data in via property/attribute, intent out via
 // `iot-command` events. NEVER imports api.ts or ws.ts.
 
-import { manifestFor, type WidgetType } from '@nodrix/widgets-shared';
-import { extractVariables, isChartSeriesExtractor } from '@nodrix/widgets-shared';
+import { manifestFor, type WidgetType } from '@insight/widgets-shared';
+import { extractVariables, isChartSeriesExtractor } from '@insight/widgets-shared';
 import type { CompactSeries, Layout, SnapshotMsg, UpdateMsg, WidgetInstance } from '../types';
 
 export type DataIndex = {

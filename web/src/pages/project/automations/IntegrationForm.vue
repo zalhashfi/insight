@@ -4,7 +4,7 @@ import { useProjectStore } from '../../../stores/project';
 import Icon from '../../../components/Icon.vue';
 import FieldInput from './FieldInput.vue';
 import { toast } from '../../../lib/toast';
-import { connSpec, connectionFields } from '@nodrix/integrations-shared';
+import { connSpec, connectionFields } from '@insight/integrations-shared';
 import type { Integration, IntegrationKind } from '../../../types';
 
 const props = defineProps<{

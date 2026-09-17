@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue';
 
 export type ThemeMode = 'light' | 'dark' | 'system';
 
-const STORAGE_KEY = 'nodrix:theme';
+const STORAGE_KEY = 'insight:theme';
 
 function readStored(): ThemeMode {
   const v = localStorage.getItem(STORAGE_KEY);

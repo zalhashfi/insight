@@ -3,7 +3,7 @@ import { newId } from '../../platform/lib/ids';
 import { recordAudit } from '../../platform/lib/audit';
 import { executeIntegration, recordIntegrationRun } from '../../platform/engine/integrations';
 import type { AutomationContext, IntegrationRow as EngineIntegrationRow } from '../../platform/engine/types';
-import { VALID_KINDS } from '@nodrix/integrations-shared';
+import { VALID_KINDS } from '@insight/integrations-shared';
 import { safeParse, buildUpdate } from '../../platform/lib/sql';
 import { sealIntegrationConfig, openIntegrationConfig } from '../../platform/lib/integration-secrets';
 import { type Actor, ServiceError } from '../../platform/lib/service';

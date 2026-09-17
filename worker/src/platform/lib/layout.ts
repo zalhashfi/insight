@@ -2,10 +2,10 @@
 // and variable extractors are driven by the shared manifest catalog — never
 // per-type branches in this file.
 
-import { extractVariables, isChartSeriesExtractor } from '@nodrix/widgets-shared';
-import { ALLOWED_TYPES as MANIFEST_ALLOWED, manifestFor } from '@nodrix/widgets-shared';
+import { extractVariables, isChartSeriesExtractor } from '@insight/widgets-shared';
+import { ALLOWED_TYPES as MANIFEST_ALLOWED, manifestFor } from '@insight/widgets-shared';
 
-export type { WidgetType } from '@nodrix/widgets-shared';
+export type { WidgetType } from '@insight/widgets-shared';
 
 const ALLOWED_TYPES: ReadonlySet<string> = MANIFEST_ALLOWED;
 
@@ -33,7 +33,11 @@ export type Layout = {
   // Which device this dashboard reads. Absent means the project's default,
   // which is what every dashboard did before devices existed.
   device?: string | null;
+  // Optional embed presentation settings (persisted per dashboard).
+  embed?: { bg: string } | null;
 };
+
+export const EMBED_BG_RE = /^(#[0-9a-fA-F]{6}|transparent)$/;
 
 // Public-view refresh bounds: floor matches the /state edge-cache TTL (polling
 // faster just returns the cached response); ceiling is 1h.
@@ -99,6 +103,17 @@ export function validateLayout(input: unknown): { ok: true; value: Layout } | { 
   }
   const device = typeof d === 'string' && d.trim() ? d.trim() : null;
 
+  let embed: { bg: string } | null | undefined;
+  const em = input['embed'];
+  if (em === null) {
+    embed = null;
+  } else if (em !== undefined) {
+    if (!isObject(em) || typeof em['bg'] !== 'string' || !EMBED_BG_RE.test(em['bg'])) {
+      return { ok: false, reason: 'layout.embed.bg must be #rrggbb or transparent' };
+    }
+    embed = { bg: em['bg'].toLowerCase() };
+  }
+
   return {
     ok: true,
     value: {
@@ -107,6 +122,7 @@ export function validateLayout(input: unknown): { ok: true; value: Layout } | { 
       ...(mobile !== undefined ? { mobile } : {}),
       ...(refresh !== undefined ? { refresh } : {}),
       ...(device !== null ? { device } : {}),
+      ...(embed !== undefined ? { embed } : {}),
     },
   };
 }

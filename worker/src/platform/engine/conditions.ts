@@ -1,6 +1,6 @@
 // Condition node evaluation, keyed by kind. Returns the boolean that selects the
 // node's true/false output port. Adding a condition = register a handler here and
-// add its manifest to @nodrix/blocks-shared.
+// add its manifest to @insight/blocks-shared.
 
 import { matchVariableCondition } from './triggers';
 import type { AutomationContext, VariableOperator } from './types';

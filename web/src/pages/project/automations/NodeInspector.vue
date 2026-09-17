@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, watch } from 'vue';
 import { useProjectStore } from '../../../stores/project';
-import { connOperations, operationFields, connSpec, type IntegrationKind } from '@nodrix/integrations-shared';
+import { connOperations, operationFields, connSpec, type IntegrationKind } from '@insight/integrations-shared';
 import { blockOf, type BlockData } from './graph-edit';
 import Dropdown from '../../../components/Dropdown.vue';
 import FieldInput from './FieldInput.vue';

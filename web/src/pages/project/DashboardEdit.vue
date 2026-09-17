@@ -4,7 +4,7 @@ import { useRoute, useRouter } from 'vue-router';
 import { GridLayout, GridItem } from 'grid-layout-plus';
 import { useProjectStore } from '../../stores/project';
 import { toast } from '../../lib/toast';
-import { manifestFor as specFor } from '@nodrix/widgets-shared';
+import { manifestFor as specFor } from '@insight/widgets-shared';
 import { GRID_COLUMNS, ROW_HEIGHT, GRID_MARGIN, MIN_UNITS, normalizeLayout } from '../../builder/grid';
 import Dropdown from '../../components/Dropdown.vue';
 import WidgetPalette from '../../builder/WidgetPalette.vue';

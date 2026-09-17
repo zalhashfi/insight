@@ -27,7 +27,14 @@
 /* Accent palettes — each maps the scale to a built-in Tailwind palette.
    Default is orange (no data-accent attribute needed). The accent store sets
    document.documentElement.dataset.accent to switch. */
-:root,
+:root {
+  --accent-50: var(--color-blue-50);   --accent-100: var(--color-blue-100);
+  --accent-200: var(--color-blue-200); --accent-300: var(--color-blue-300);
+  --accent-400: var(--color-blue-400); --accent-500: var(--color-blue-500);
+  --accent-600: var(--color-blue-600); --accent-700: var(--color-blue-700);
+  --accent-800: var(--color-blue-800); --accent-900: var(--color-blue-900);
+  --accent-950: var(--color-blue-950);
+}
 [data-accent='orange'] {
   --accent-50: var(--color-orange-50);   --accent-100: var(--color-orange-100);
   --accent-200: var(--color-orange-200); --accent-300: var(--color-orange-300);

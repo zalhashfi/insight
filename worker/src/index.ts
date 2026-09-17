@@ -11,17 +11,16 @@
 import { OAuthProvider } from '@cloudflare/workers-oauth-provider';
 import type { Env } from './env';
 import app from './app';
-import { NodrixMcpAgent } from './mcp/agent';
+import { InsightMcpAgent } from './mcp/agent';
 import { mcpEnabled } from './mcp/flags';
-import { sendHeartbeat } from './platform/lib/usage-stats';
 
 export { ProjectDO } from './platform/durable-objects/project-do';
 export { DashboardDO } from './platform/durable-objects/dashboard-do';
 export { SchedulerDO } from './platform/durable-objects/scheduler-do';
 export { Provision } from './platform/workflows/provision';
-export { NodrixMcpAgent } from './mcp/agent';
+export { InsightMcpAgent } from './mcp/agent';
 
-const oauthMcpHandler = NodrixMcpAgent.serve('/v1/mcp/oauth');
+const oauthMcpHandler = InsightMcpAgent.serve('/v1/mcp/oauth');
 const apiHandler = {
   fetch: async (request: Request, env: Env, ctx: ExecutionContext): Promise<Response> => {
     if (!(await mcpEnabled(env))) {
@@ -50,9 +49,5 @@ export default {
   fetch(req: Request, env: Env, ctx: ExecutionContext) {
     (env as { OAUTH_KV: KVNamespace }).OAUTH_KV = env.KV;
     return oauthProvider.fetch(req, env, ctx);
-  },
-  // Daily cron → anonymous usage heartbeat (refresh version/counts/last_seen).
-  scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext) {
-    sendHeartbeat(env, ctx);
   },
 } satisfies ExportedHandler<Env>;

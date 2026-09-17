@@ -3,6 +3,7 @@ import type { Env } from '../../env';
 import { requireProjectToken, type ProjectTokenContextVars } from '../../platform/middleware/require-project-token';
 import { projectStub } from '../../platform/durable-objects/stubs';
 import { parseTelemetryBody, MAX_POINTS, MAX_KEY_LEN, MAX_STRING_VALUE } from './validate';
+import type { IngestPoint } from '../../platform/durable-objects/project-do';
 import { upsertVariables } from './variables';
 import { normaliseDeviceKey, resolveDevice, touchDevice } from '../devices/service';
 
@@ -42,7 +43,7 @@ telemetry.post('/', async (c) => {
 
   const { project_id } = c.get('projectToken');
   const now = Math.floor(Date.now() / 1000);
-  const deviceKey = normaliseDeviceKey(c.req.header('x-nodrix-device'));
+  const deviceKey = normaliseDeviceKey(c.req.header('x-insight-device') ?? c.req.header('x-nodrix-device'));
   const device = await resolveDevice(c.env, project_id, deviceKey, now);
 
   const effectivePoints: IngestPoint[] = points.map((p) => {

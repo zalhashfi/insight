@@ -189,14 +189,14 @@ const initials = computed(() => {
         v-if="ui.sidebarRailed"
         class="grid h-9 w-9 shrink-0 place-items-center rounded-md bg-neutral-900 dark:bg-neutral-800"
       >
-        <img src="/white_logo.png" alt="nodrix" class="h-6 w-6 object-contain" />
+        <img src="/white_logo.png" alt="INSIGHT" class="h-6 w-6 object-contain" />
       </div>
       <!-- Expanded: bind src to the active theme so only one variant downloads
            (CSS `hidden` would still fetch both). -->
       <img
         v-else
         :src="theme.resolved === 'dark' ? '/white_logo.png' : '/dark_logo.png'"
-        alt="nodrix"
+        alt="INSIGHT"
         class="h-7 w-auto"
       />
     </div>

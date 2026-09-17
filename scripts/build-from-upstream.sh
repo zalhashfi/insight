@@ -29,7 +29,7 @@
 
 set -euo pipefail
 
-UPSTREAM_REPO="${NODRIX_UPSTREAM_REPO:-zalhashfi/nodrix}"
+UPSTREAM_REPO="${INSIGHT_UPSTREAM_REPO:-zalhashfi/insight}"
 DEPLOY_CHANNEL="${NODRIX_DEPLOY_CHANNEL:-release}"
 UPSTREAM_DIR="/tmp/nodrix-upstream"
 WRANGLER_BACKUP="/tmp/nodrix-wrangler.toml"
@@ -40,7 +40,7 @@ if [ -z "${WORKERS_CI_COMMIT_SHA:-}" ]; then
   bun install
   bun scripts/gen-version.ts
   bun scripts/gen-migrations.ts
-  bun run --filter @nodrix/web build
+  bun run --filter @insight/web build
   exit 0
 fi
 
@@ -86,7 +86,7 @@ echo "[build-from-upstream] upstream commit: ${UPSTREAM_SHA}"
 rm -rf "${UPSTREAM_DIR}/.git"
 
 # 3. Overlay upstream onto the local working tree IN-PLACE. Critical: do NOT
-#    rm-rf and recreate directories. The outer `bun run --filter @nodrix/worker
+#    rm-rf and recreate directories. The outer `bun run --filter @insight/worker
 #    build` process is holding a CWD inside worker/, and the wrangler subprocess
 #    it spawned is what's running THIS script. If we wipe worker/ and recreate
 #    it, those processes end up with a CWD pointing to a deleted inode — wrangler
@@ -141,6 +141,6 @@ rm -rf ./deploy
 bun install
 bun scripts/gen-version.ts
 bun scripts/gen-migrations.ts
-bun run --filter @nodrix/web build
+bun run --filter @insight/web build
 
 echo "[build-from-upstream] done"

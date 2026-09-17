@@ -13,9 +13,9 @@ import { registerWriteTools } from './tools-write';
 import { registerResources } from './resources';
 import { mcpWriteEnabled } from './flags';
 
-export class NodrixMcpAgent extends McpAgent<Env, unknown, McpProps> {
+export class InsightMcpAgent extends McpAgent<Env, unknown, McpProps> {
   server = new McpServer(
-    { name: 'nodrix', version: VERSION },
+    { name: 'insight', version: VERSION },
     { capabilities: { tools: {}, resources: {} } }
   );
 

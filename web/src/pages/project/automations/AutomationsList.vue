@@ -6,7 +6,7 @@ import { toast } from '../../../lib/toast';
 import Icon from '../../../components/Icon.vue';
 import AutomationCard from './AutomationCard.vue';
 import { RECIPES, recipeById } from './automation-recipes';
-import { connSpec } from '@nodrix/integrations-shared';
+import { connSpec } from '@insight/integrations-shared';
 import type { Automation } from '../../../types';
 
 const project = useProjectStore();

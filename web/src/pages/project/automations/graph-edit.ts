@@ -2,7 +2,7 @@
 // helpers the canvas editor needs (ids, default config, cycle check).
 
 import type { Node, Edge } from '@vue-flow/core';
-import { buildLinearGraph, findBlock, type AutomationGraph, type BlockManifest } from '@nodrix/blocks-shared';
+import { buildLinearGraph, findBlock, type AutomationGraph, type BlockManifest } from '@insight/blocks-shared';
 import type { Automation } from '../../../types';
 
 export type BlockData = { kind: string; config: Record<string, unknown> };

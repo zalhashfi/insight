@@ -2,7 +2,7 @@
 import { computed, inject, ref, type Ref } from 'vue';
 import Dropdown from '../components/Dropdown.vue';
 import Toggle from '../components/Toggle.vue';
-import type { WidgetField } from '@nodrix/widgets-shared';
+import type { WidgetField } from '@insight/widgets-shared';
 
 defineOptions({ name: 'ConfigField' });
 

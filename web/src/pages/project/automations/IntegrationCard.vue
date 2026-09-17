@@ -6,7 +6,7 @@ import { toast } from '../../../lib/toast';
 import Icon from '../../../components/Icon.vue';
 import Toggle from '../../../components/Toggle.vue';
 import StatusPill from '../../../components/StatusPill.vue';
-import { connSpec, summarize } from '@nodrix/integrations-shared';
+import { connSpec, summarize } from '@insight/integrations-shared';
 import type { Integration, Automation } from '../../../types';
 
 const props = defineProps<{

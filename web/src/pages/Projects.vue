@@ -6,6 +6,7 @@ import { useUiStore } from '../stores/ui';
 import { confirm } from '../lib/confirm';
 import { toast } from '../lib/toast';
 import type { Project } from '../types';
+import ExportCsvDialog from '../components/ExportCsvDialog.vue';
 
 const session = useSessionStore();
 const ui = useUiStore();
@@ -24,6 +25,9 @@ const openMenuFor = ref<string | null>(null);
 const editing = ref<Project | null>(null);
 const form = ref({ name: '', description: '' });
 const saving = ref(false);
+
+// CSV export modal state.
+const csvExportProject = ref<Project | null>(null);
 
 async function create() {
   const n = newName.value.trim();
@@ -110,6 +114,12 @@ function exportProject(p: Project, event: Event) {
   event.stopPropagation();
   openMenuFor.value = null;
   window.location.href = `/v1/admin/projects/${p.id}/export`;
+}
+
+function openCsvExport(p: Project, event: Event) {
+  event.stopPropagation();
+  openMenuFor.value = null;
+  csvExportProject.value = p;
 }
 
 function deleteFromMenu(p: Project, event: Event) {
@@ -242,6 +252,11 @@ watch(
             >Export data</button>
             <button
               type="button"
+              class="block w-full px-3 py-1.5 text-left text-xs hover:bg-neutral-100 dark:hover:bg-neutral-800"
+              @click="openCsvExport(p, $event)"
+            >Export CSV…</button>
+            <button
+              type="button"
               class="block w-full px-3 py-1.5 text-left text-xs text-red-700 hover:bg-red-50 dark:text-red-400 dark:hover:bg-red-950/30"
               @click="deleteFromMenu(p, $event)"
             >Delete project</button>
@@ -324,6 +339,14 @@ watch(
           </div>
         </form>
       </div>
+
     </div>
+
+    <!-- Export CSV modal -->
+    <ExportCsvDialog
+      v-if="csvExportProject"
+      :project="csvExportProject"
+      @close="csvExportProject = null"
+    />
   </div>
 </template>

@@ -13,6 +13,7 @@ import { upsertVariables } from '../../domains/telemetry/variables';
 import { defaultDeviceId, normaliseDeviceKey, resolveDevice, recordDeviceSeen, touchDevice } from '../../domains/devices/service';
 import { reconcile } from '../../domains/firmware/ota';
 import { migrateSchema } from './schema';
+import { hourBucket } from '../lib/time-bucket';
 import { PROJECT_SCHEMA } from './project-schema';
 
 // Project Durable Object (one per project id, SQLite-backed): latest variable
@@ -611,7 +612,8 @@ export class ProjectDO extends DurableObject<Env> {
     const server = pair[1] as WebSocket;
     this.ctx.acceptWebSocket(server);
 
-    if (request.headers.get('x-nodrix-role') === 'agent') {
+    const role = request.headers.get('x-insight-role') ?? request.headers.get('x-nodrix-role');
+    if (role === 'agent') {
       server.serializeAttachment({ role: 'agent' });
       return new Response(null, { status: 101, webSocket: client });
     }
@@ -838,13 +840,4 @@ function safeParse(s: string): unknown {
   } catch {
     return s;
   }
-}
-
-function hourBucket(unixSeconds: number): string {
-  const d = new Date(unixSeconds * 1000);
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  const hh = String(d.getUTCHours()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}-${hh}`;
 }

@@ -38,7 +38,7 @@ export type Action =
 
 // Flow-graph model lives in the shared catalog (used by web + worker); re-exported
 // so engine imports keep resolving from './types'.
-export type { GraphNode, GraphEdge, AutomationGraph } from '@nodrix/blocks-shared';
+export type { GraphNode, GraphEdge, AutomationGraph } from '@insight/blocks-shared';
 
 export type TriggerSource = 'variable' | 'manual' | 'event' | 'schedule' | 'sunset_sunrise';
 
@@ -79,4 +79,4 @@ export type AutomationRow = {
 
 // Minimal column projection the engine reads from D1 — defined in the shared
 // integrations package alongside the runtime that consumes it.
-export type { IntegrationRow } from '@nodrix/integrations-shared';
+export type { IntegrationRow } from '@insight/integrations-shared';

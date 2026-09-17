@@ -1,5 +1,5 @@
 // Action node handlers, keyed by kind. Adding an action = register a handler here
-// and add its manifest to @nodrix/blocks-shared.
+// and add its manifest to @insight/blocks-shared.
 
 import type { Env } from '../../env';
 import { executeIntegration, recordIntegrationRun } from './integrations';

@@ -3,7 +3,7 @@
 // conditions, multiple triggers — that the user then tweaks. Pure frontend; the
 // recipe only seeds the draft and nothing persists until Save.
 
-import type { AutomationGraph } from '@nodrix/blocks-shared';
+import type { AutomationGraph } from '@insight/blocks-shared';
 
 export type Recipe = {
   id: string;

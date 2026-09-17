@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, ref } from 'vue';
-import type { WidgetManifest } from '@nodrix/widgets-shared';
-import { CATALOG } from '@nodrix/widgets-shared';
+import type { WidgetManifest } from '@insight/widgets-shared';
+import { CATALOG } from '@insight/widgets-shared';
 type WidgetCategory = 'Monitor' | 'Control';
 type WidgetSpec = WidgetManifest;
 const CATEGORY_ORDER: ReadonlyArray<WidgetCategory> = ['Monitor', 'Control'];

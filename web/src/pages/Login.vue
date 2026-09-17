@@ -99,7 +99,7 @@ async function signInWith(provider: 'google' | 'github') {
   <main class="mx-auto flex h-full max-w-md flex-col justify-center px-4 py-12 sm:px-6">
     <div class="rounded-xl border border-neutral-200 bg-white p-6 shadow-sm dark:border-neutral-800 dark:bg-neutral-900">
       <h1 class="text-xl font-semibold tracking-tight">
-        {{ mode === 'register' ? 'Create owner account' : 'Sign in to nodrix' }}
+        {{ mode === 'register' ? 'Create owner account' : 'Sign in to INSIGHT' }}
       </h1>
       <p v-if="mode === 'register'" class="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
         First account becomes the owner of this deployment.
@@ -197,16 +197,10 @@ async function signInWith(provider: 'google' | 'github') {
       </div>
     </div>
 
-    <!-- Backlink to the project site (instance is noindex/follow, so equity flows). -->
+    <!-- No outbound link: the deployment is the operator's own, and a backlink
+         to the upstream project would be a link to somebody else's site. -->
     <p class="mt-6 text-center text-xs text-neutral-400 dark:text-neutral-500">
-      Powered by
-      <a
-        href="https://nodrix.live"
-        target="_blank"
-        rel="noopener"
-        class="font-medium text-neutral-500 underline-offset-2 hover:text-accent-600 hover:underline dark:text-neutral-400"
-      >nodrix</a>
-      — your own IoT cloud, on Cloudflare.
+      Your own IoT cloud, on Cloudflare.
     </p>
   </main>
 </template>

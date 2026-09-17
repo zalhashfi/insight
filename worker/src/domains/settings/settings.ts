@@ -4,6 +4,8 @@ import { requireSession, type UserContextVars } from '../../platform/middleware/
 import { getSetting, setSetting } from '../../platform/lib/deployment-settings';
 import { AUDIT_ENABLED_KEY, recordAudit } from '../../platform/lib/audit';
 import { MCP_ENABLED_KEY, MCP_WRITE_ENABLED_KEY } from '../../mcp/flags';
+import { agentRepo, setAgentRepo } from '../firmware/agent-config';
+import { serviceErrorResponse } from '../../platform/lib/service';
 
 // Deployment-wide settings — owner only. The audit-log toggle and the MCP
 // server switches.
@@ -18,15 +20,17 @@ settings.use('*', async (c, next) => {
 
 // GET /v1/admin/settings
 settings.get('/', async (c) => {
-  const [auditEnabled, mcpEnabled, mcpWriteEnabled] = await Promise.all([
+  const [auditEnabled, mcpEnabled, mcpWriteEnabled, agentRepoName] = await Promise.all([
     getSetting(c.env, AUDIT_ENABLED_KEY),
     getSetting(c.env, MCP_ENABLED_KEY),
     getSetting(c.env, MCP_WRITE_ENABLED_KEY),
+    agentRepo(c.env),
   ]);
   return c.json({
     audit_log_enabled: auditEnabled === '1',
     mcp_enabled: mcpEnabled === '1',
     mcp_write_enabled: mcpWriteEnabled === '1',
+    agent_repo: agentRepoName,
   });
 });
 
@@ -101,6 +105,27 @@ settings.put('/mcp-write', async (c) => {
   });
 
   return c.json({ mcp_write_enabled: enabled });
+});
+
+// PUT /v1/admin/settings/agent-repo  body: { repo: string | null }
+// Which GitHub repo the Code page offers the build agent from. Null clears the
+// setting, falling the deployment back to INSIGHT_AGENT_REPO or the default.
+settings.put('/agent-repo', async (c) => {
+  const actor = c.get('user');
+  const body = await c.req.json<{ repo?: string | null }>();
+  try {
+    await setAgentRepo(c.env, body.repo ?? null);
+    await recordAudit(c.env, {
+      projectId: null,
+      userId: actor.id,
+      action: 'settings.agent_repo',
+      targetType: 'deployment',
+      metadata: { repo: body.repo ?? null },
+    });
+    return c.json({ agent_repo: await agentRepo(c.env) });
+  } catch (e) {
+    return serviceErrorResponse(c, e);
+  }
 });
 
 export default settings;

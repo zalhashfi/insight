@@ -14,7 +14,7 @@ import {
   applySnapshotDelta,
   type DataIndex,
 } from '../builder/render-widget';
-import { manifestFor, type WidgetType } from '@nodrix/widgets-shared';
+import { manifestFor, type WidgetType } from '@insight/widgets-shared';
 import { ROW_HEIGHT, GRID_MARGIN, normalizeLayout } from '../builder/grid';
 import type { CompactSeries, Layout, SnapshotMsg, UpdateMsg } from '../types';
 

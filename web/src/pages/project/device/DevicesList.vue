@@ -6,8 +6,38 @@ import { toast } from '../../../lib/toast';
 import { relativeTime, formatAbsolute } from '../../../lib/time';
 import Spinner from '../../../components/Spinner.vue';
 import Dropdown from '../../../components/Dropdown.vue';
-
+import FirmwareUploadDialog from '../../../components/FirmwareUploadDialog.vue';
+import { useSessionStore } from '../../../stores/session';
+import { useEspFlasher } from '../../../composables/useEspFlasher';
+import { useSerialPort } from '../../../composables/useSerialPort';
+import { api } from '../../../api';
 const project = useProjectStore();
+const session = useSessionStore();
+const canManageFirmware = computed(() => session.user?.role === 'owner' || session.user?.role === 'admin');
+const showUpload = ref(false);
+
+const { flash } = useEspFlasher();
+const { port, request: requestPort } = useSerialPort();
+const flashingId = ref<string | null>(null);
+
+async function flashUsb(fwId: string) {
+  const fw = project.firmware.find((f) => f.id === fwId);
+  if (!fw) return;
+  flashingId.value = fw.id;
+  try {
+    if (!port.value && !(await requestPort())) return;
+    const pid = project.currentProjectId ?? '';
+    const bytes = new Uint8Array(await api.bytes(`/v1/admin/projects/${pid}/firmware/${fw.id}/image`));
+    const offset = fw.target && fw.target.includes('esp8266') ? 0x0 : 0x10000;
+    if (await flash([{ data: bytes, address: offset }])) {
+      toast.success(`Flashed ${fw.version} over USB`);
+    }
+  } catch (e) {
+    toast.error((e as Error).message);
+  } finally {
+    flashingId.value = null;
+  }
+}
 const loading = ref(true);
 
 onMounted(async () => {
@@ -55,8 +85,10 @@ async function saveName(id: string) {
 }
 
 // Build ids are the version, so a saved build needs a human-sized handle.
-function buildLabel(f: { version: string; created_at: number }): string {
-  return `${f.version.replace(/^bld_/, '').slice(0, 6)} · ${relativeTime(f.created_at)}`;
+function buildLabel(f: { version: string; target?: string | null; created_at: number }): string {
+  const v = f.version.startsWith('bld_') ? f.version.slice(4, 10) : f.version;
+  const t = f.target ? ` [${f.target.split(':').slice(-1)[0]}]` : '';
+  return `${v}${t} · ${relativeTime(f.created_at)}`;
 }
 
 const firmwareOptions = computed(() =>
@@ -100,7 +132,25 @@ async function forget(id: string, name: string) {
     <Spinner size="sm" label="Loading devices…" />
   </div>
 
-  <div v-else class="overflow-hidden rounded-xl border border-neutral-200 dark:border-neutral-800">
+  <div v-else class="space-y-3">
+    <div class="flex items-center justify-between">
+      <div class="text-xs text-neutral-500 dark:text-neutral-400">
+        {{ project.devices.length }} {{ project.devices.length === 1 ? 'device' : 'devices' }}
+      </div>
+      <button
+        v-if="canManageFirmware"
+        type="button"
+        class="inline-flex items-center gap-1.5 rounded-md bg-accent-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-accent-700"
+        @click="showUpload = true"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-3.5 w-3.5">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 4v16m8-8H4" />
+        </svg>
+        Upload firmware
+      </button>
+    </div>
+
+    <div class="overflow-hidden rounded-xl border border-neutral-200 dark:border-neutral-800">
     <table class="w-full text-sm">
       <thead class="bg-neutral-50 text-left text-xs uppercase tracking-wide text-neutral-500 dark:bg-neutral-900 dark:text-neutral-400">
         <tr>
@@ -142,14 +192,28 @@ async function forget(id: string, name: string) {
             {{ d.firmware_version ? d.firmware_version.replace(/^bld_/, '').slice(0, 6) : '—' }}
           </td>
           <td class="px-4 py-2.5">
-            <Dropdown
-              :model-value="d.desired_firmware_id ?? ''"
-              :options="firmwareOptions"
-              placeholder="Nothing pending"
-              size="sm"
-              class="max-w-[13rem]"
-              @update:model-value="(v) => assign(d.id, String(v))"
-            />
+            <div class="flex items-center gap-1.5">
+              <Dropdown
+                :model-value="d.desired_firmware_id ?? ''"
+                :options="firmwareOptions"
+                placeholder="Nothing pending"
+                size="sm"
+                class="max-w-[13rem]"
+                @update:model-value="(v) => assign(d.id, String(v))"
+              />
+              <button
+                v-if="canManageFirmware && d.desired_firmware_id"
+                type="button"
+                :disabled="flashingId === d.desired_firmware_id"
+                class="rounded border border-neutral-300 p-1 text-neutral-600 hover:bg-neutral-100 disabled:opacity-50 dark:border-neutral-700 dark:text-neutral-300 dark:hover:bg-neutral-800"
+                title="Flash this firmware over USB now"
+                @click="flashUsb(d.desired_firmware_id!)"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="h-3.5 w-3.5">
+                  <path stroke-linecap="round" stroke-linejoin="round" d="M13 10V3L4 14h7v7l9-11h-7z" />
+                </svg>
+              </button>
+            </div>
             <span v-if="otaState(d)" class="mt-1 block text-[10px] text-neutral-500">{{ otaState(d) }}</span>
           </td>
           <td class="px-4 py-2.5 text-neutral-600 dark:text-neutral-400" :title="d.last_seen ? formatAbsolute(d.last_seen) : ''">
@@ -176,5 +240,7 @@ async function forget(id: string, name: string) {
         </tr>
       </tbody>
     </table>
+    <FirmwareUploadDialog v-if="showUpload" @close="showUpload = false" />
+  </div>
   </div>
 </template>

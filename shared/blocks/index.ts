@@ -2,7 +2,7 @@
 // eval/run lives in the worker engine, so these are pure metadata; the kind enums
 // and validation sets all derive from here. Worker-safe (no fetch/DOM).
 
-import type { SummaryDescriptor } from '@nodrix/integrations-shared';
+import type { SummaryDescriptor } from '@insight/integrations-shared';
 import { TRIGGER_CATALOG } from './triggers';
 import { ACTION_CATALOG } from './actions';
 import { CONDITION_CATALOG } from './conditions';

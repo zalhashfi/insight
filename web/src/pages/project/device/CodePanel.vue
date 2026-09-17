@@ -48,23 +48,28 @@ const buildLog = ref<string[]>([]);
 const buildError = ref('');
 const noAgent = ref(false);
 
-const AGENT_RELEASES = 'https://github.com/decoded-cipher/nodrix-agent/releases/latest';
-
+// The build agent is optional and lives in a separate repo the operator owns.
+// Which one comes from the deployment setting, so nothing here points a
+// download at a repo nobody on this deployment controls.
+const agentRepoName = ref('');
+const agentReleases = computed(() =>
+  agentRepoName.value ? `https://github.com/${agentRepoName.value}/releases/latest` : ''
+);
 // Apple silicon and Intel are indistinguishable from the user agent.
 const agentBinary = computed(() => {
   const ua = navigator.userAgent;
-  if (ua.includes('Win')) return 'nodrix-agent-windows-x64.exe';
-  if (ua.includes('Mac')) return 'nodrix-agent-macos-arm64';
-  return 'nodrix-agent-linux-x64';
+  if (ua.includes('Win')) return 'insight-agent-windows-x64.exe';
+  if (ua.includes('Mac')) return 'insight-agent-macos-arm64';
+  return 'insight-agent-linux-x64';
 });
 
 const agentSetup = computed(() => [
-  `curl -fsSL -o nodrix-agent ${AGENT_RELEASES}/download/${agentBinary.value}`,
-  'chmod +x nodrix-agent',
+  `curl -fsSL -o insight-agent ${agentReleases.value}/download/${agentBinary.value}`,
+  'chmod +x insight-agent',
   '',
   `NODRIX_INSTANCE=${window.location.origin} \\`,
   'NODRIX_TOKEN=<admin token from Account -> Tokens> \\',
-  './nodrix-agent',
+  './insight-agent',
 ].join('\n'));
 // The artifact outlives the flash, so the same build can also be kept for OTA.
 const lastBuild = ref('');
@@ -139,10 +144,20 @@ async function saveForOta() {
   }
 }
 
-const storageKey = computed(() => `nodrix:sketch:${project.currentProjectId ?? 'none'}`);
+const storageKey = computed(() => `insight:sketch:${project.currentProjectId ?? 'none'}`);
 
-onMounted(() => {
+onMounted(async () => {
   code.value = localStorage.getItem(storageKey.value) ?? STARTER;
+  try {
+    const cfg = await api.get<{ agent_repo: string }>(
+      `/v1/admin/projects/${project.currentProjectId}/build/config`
+    );
+    agentRepoName.value = cfg.agent_repo;
+  } catch {
+    // Nothing to download without a configured repo — show the no-agent panel
+    // instead of a link that would 404.
+    noAgent.value = true;
+  }
 });
 
 watch(code, (v) => localStorage.setItem(storageKey.value, v));
@@ -250,7 +265,7 @@ function download() {
               class="rounded-md border border-amber-400 px-2.5 py-1 text-xs font-medium text-amber-900 hover:bg-amber-100 dark:border-amber-800 dark:text-amber-200 dark:hover:bg-amber-900/40"
               @click="copyAgentSetup"
             >Copy</button>
-            <a :href="AGENT_RELEASES" target="_blank" rel="noopener" class="text-xs font-medium text-amber-900 underline dark:text-amber-200">
+            <a :href="agentReleases" target="_blank" rel="noopener" class="text-xs font-medium text-amber-900 underline dark:text-amber-200">
               Other platforms
             </a>
             <span class="text-[11px] text-amber-900/70 dark:text-amber-200/70">

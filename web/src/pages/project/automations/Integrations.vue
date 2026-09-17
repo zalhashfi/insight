@@ -4,7 +4,7 @@ import { useProjectStore } from '../../../stores/project';
 import Icon from '../../../components/Icon.vue';
 import IntegrationCard from './IntegrationCard.vue';
 import IntegrationForm from './IntegrationForm.vue';
-import { EXECUTABLE_CONNECTIONS, COMING_SOON_CONNECTIONS } from '@nodrix/integrations-shared';
+import { EXECUTABLE_CONNECTIONS, COMING_SOON_CONNECTIONS } from '@insight/integrations-shared';
 import type { Automation, Integration, IntegrationKind } from '../../../types';
 
 const project = useProjectStore();

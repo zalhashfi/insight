@@ -16,7 +16,7 @@ control.get('/', async (c) => {
   const device = await resolveDevice(
     c.env,
     project_id,
-    normaliseDeviceKey(c.req.header('x-nodrix-device')),
+    normaliseDeviceKey(c.req.header('x-insight-device') ?? c.req.header('x-nodrix-device')),
     Math.floor(Date.now() / 1000)
   );
   if (device) c.executionCtx.waitUntil(touchDevice(c.env, device.id));
@@ -35,7 +35,7 @@ control.post('/ack', async (c) => {
   const device = await resolveDevice(
     c.env,
     project_id,
-    normaliseDeviceKey(c.req.header('x-nodrix-device')),
+    normaliseDeviceKey(c.req.header('x-insight-device') ?? c.req.header('x-nodrix-device')),
     Math.floor(Date.now() / 1000)
   );
   const stub = projectStub(c.env, project_id);

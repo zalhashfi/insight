@@ -14,9 +14,9 @@ import { listDashboards, getDashboard } from '../domains/dashboards/service';
 import { listAutomations } from '../domains/automations/service';
 import { listIntegrations } from '../domains/integrations/service';
 import { redactIntegration } from './redact';
-import { CATALOG as WIDGET_CATALOG } from '@nodrix/widgets-shared';
-import { TRIGGER_CATALOG, CONDITION_CATALOG, ACTION_CATALOG, type BlockManifest } from '@nodrix/blocks-shared';
-import { CATALOG as INTEGRATION_CATALOG, connectionFields, operationFields } from '@nodrix/integrations-shared';
+import { CATALOG as WIDGET_CATALOG } from '@insight/widgets-shared';
+import { TRIGGER_CATALOG, CONDITION_CATALOG, ACTION_CATALOG, type BlockManifest } from '@insight/blocks-shared';
+import { CATALOG as INTEGRATION_CATALOG, connectionFields, operationFields } from '@insight/integrations-shared';
 
 // Public MCP shape — mirrors what the old worker/src/mcp/widget-specs.ts exposed.
 const WIDGET_SPECS = WIDGET_CATALOG.map((m) => ({

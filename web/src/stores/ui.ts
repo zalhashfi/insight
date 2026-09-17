@@ -2,8 +2,8 @@ import { defineStore } from 'pinia';
 import { computed, ref } from 'vue';
 import { useSessionStore } from './session';
 
-const LAST_PROJECT_KEY = 'nodrix:last-project';
-const SIDEBAR_COLLAPSED_KEY = 'nodrix:sidebar-collapsed';
+const LAST_PROJECT_KEY = 'insight:last-project';
+const SIDEBAR_COLLAPSED_KEY = 'insight:sidebar-collapsed';
 
 // Below this width the sidebar becomes an off-canvas drawer instead of a static
 // column. Matches Tailwind's `lg` breakpoint (1024px).

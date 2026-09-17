@@ -18,7 +18,7 @@ import { useIsPhone } from '../../composables/useViewport';
 import { effectiveMobileLayout } from '../../builder/mobile-layout';
 import { publicApi, PublicApiError } from '../../lib/public-api';
 import { useThemeStore } from '../../stores/theme';
-import type { CompactSeries, Layout, PublicDashboard, PublicState } from '../../types';
+import { EMBED_BG_RE, type CompactSeries, type Layout, type PublicDashboard, type PublicState } from '../../types';
 
 const route = useRoute();
 const grid = useDashboardGrid();
@@ -40,6 +40,13 @@ const onlyItem = computed(() => {
   const q = route.query['item'];
   return typeof q === 'string' && q ? q : undefined;
 });
+
+const layoutEmbedBg = ref<string | null>(null);
+const queryBg = computed(() => {
+  const q = route.query['bg'];
+  return typeof q === 'string' && EMBED_BG_RE.test(q) ? q.toLowerCase() : null;
+});
+const embedBg = computed(() => (isEmbed.value ? queryBg.value ?? layoutEmbedBg.value : null));
 
 let layout: Layout | null = null;          // desktop layout (with nested .mobile)
 let lastState: PublicState | null = null;  // accumulated full state, re-applied on remount
@@ -127,6 +134,7 @@ async function load() {
     layout = d.layout;
     itemCount.value = d.layout.items.length;
     refreshSecs.value = d.layout.refresh ?? 5; // server-clamped
+    layoutEmbedBg.value = d.layout.embed?.bg ?? null;
     status.value = 'ready';
     // Wait a tick so the container is rendered before mounting the grid.
     await Promise.resolve();
@@ -272,6 +280,7 @@ function onVisibility() {
   <main
     ref="main"
     :class="isEmbed ? 'flex h-full w-full flex-col bg-transparent' : 'flex min-h-screen flex-col bg-neutral-50 dark:bg-neutral-950'"
+    :style="embedBg ? { backgroundColor: embedBg } : undefined"
   >
     <header
       v-if="!isEmbed && !onlyItem && status === 'ready'"
@@ -282,7 +291,7 @@ function onVisibility() {
              headers, dark-ink mark on light. -->
         <img
           :src="theme.resolved === 'dark' ? '/icon-192.png' : '/icon-dark-192.png'"
-          alt="nodrix"
+          alt="INSIGHT"
           class="h-7 w-7 shrink-0 object-contain"
         />
         <div class="min-w-0">

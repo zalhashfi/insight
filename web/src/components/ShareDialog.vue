@@ -47,6 +47,32 @@ const refreshOptions = [
   { value: 60, label: 'Every minute' },
   { value: 300, label: 'Every 5 minutes' },
 ];
+const embedBg = ref<string>('transparent');
+const savingBg = ref(false);
+const isTransparentBg = computed(() => embedBg.value === 'transparent');
+
+async function setEmbedBg(bg: string) {
+  if (!dashLayout.value || bg === embedBg.value) return;
+  const prev = embedBg.value;
+  embedBg.value = bg;
+  savingBg.value = true;
+  try {
+    const updated = await project.saveDashboard(
+      props.dashboard.id,
+      { ...dashLayout.value, embed: bg === 'transparent' ? null : { bg } },
+      dashUpdatedAt.value
+    );
+    dashLayout.value = updated.layout;
+    dashUpdatedAt.value = updated.updated_at;
+    embedBg.value = updated.layout.embed?.bg ?? 'transparent';
+  } catch (e) {
+    embedBg.value = prev;
+    toast.error((e as Error).message);
+  } finally {
+    savingBg.value = false;
+  }
+}
+
 async function setRefresh(v: number) {
   if (!dashLayout.value || v === refreshSecs.value) return;
   const prev = refreshSecs.value;
@@ -71,10 +97,18 @@ async function setRefresh(v: number) {
 
 const origin = typeof window !== 'undefined' ? window.location.origin : '';
 const shareUrl = computed(() => (token.value ? `${origin}/share/${token.value}` : ''));
-const embedUrl = computed(() => (token.value ? `${origin}/embed/${token.value}` : ''));
-const widgetEmbedUrl = computed(() =>
-  token.value && selectedItem.value ? `${embedUrl.value}?item=${encodeURIComponent(selectedItem.value)}` : ''
-);
+const embedUrl = computed(() => {
+  if (!token.value) return '';
+  const base = `${origin}/embed/${token.value}`;
+  return embedBg.value && embedBg.value !== 'transparent'
+    ? `${base}?bg=${encodeURIComponent(embedBg.value)}`
+    : base;
+});
+const widgetEmbedUrl = computed(() => {
+  if (!token.value || !selectedItem.value) return '';
+  const sep = embedUrl.value.includes('?') ? '&' : '?';
+  return `${embedUrl.value}${sep}item=${encodeURIComponent(selectedItem.value)}`;
+});
 
 function iframe(src: string, height: number): string {
   return `<iframe src="${src}" width="100%" height="${height}" frameborder="0" style="border:0" loading="lazy"></iframe>`;
@@ -101,6 +135,7 @@ onMounted(async () => {
     refreshSecs.value = d.layout.refresh ?? 5;
     widgets.value = d.layout.items;
     if (widgets.value[0]) selectedItem.value = widgets.value[0].id;
+    embedBg.value = d.layout.embed?.bg ?? 'transparent';
   } catch {
     // Non-fatal: the per-widget picker just stays empty.
   }
@@ -307,6 +342,33 @@ function onKey(e: KeyboardEvent) {
               size="sm"
               @update:model-value="(v) => { if (typeof v === 'number') void setRefresh(v); }"
             />
+          </div>
+
+          <!-- 4. Embed background -->
+          <div class="flex items-center justify-between gap-3 border-t border-neutral-100 pt-4 dark:border-neutral-800">
+            <div class="min-w-0">
+              <div class="text-xs font-medium text-neutral-700 dark:text-neutral-300">Embed background</div>
+              <p class="mt-0.5 text-[11px] text-neutral-500 dark:text-neutral-400">
+                {{ savingBg ? 'Saving…' : 'Background colour when embedded in external sites.' }}
+              </p>
+            </div>
+            <div class="flex items-center gap-2">
+              <input
+                type="color"
+                :value="isTransparentBg ? '#ffffff' : embedBg"
+                :disabled="isTransparentBg || savingBg"
+                class="h-7 w-7 cursor-pointer rounded border border-neutral-300 bg-transparent p-0.5 disabled:cursor-not-allowed disabled:opacity-40 dark:border-neutral-700"
+                @change="(e) => setEmbedBg((e.target as HTMLInputElement).value)"
+              />
+              <button
+                type="button"
+                class="rounded border px-2 py-1 text-xs transition"
+                :class="isTransparentBg ? 'border-accent-600 bg-accent-50 text-accent-700 dark:border-accent-700 dark:bg-accent-950/40 dark:text-accent-300' : 'border-neutral-200 text-neutral-600 hover:bg-neutral-50 dark:border-neutral-700 dark:text-neutral-400 dark:hover:bg-neutral-800'"
+                @click="setEmbedBg(isTransparentBg ? '#ffffff' : 'transparent')"
+              >
+                {{ isTransparentBg ? 'Transparent' : 'Custom' }}
+              </button>
+            </div>
           </div>
 
           <p class="text-[11px] leading-relaxed text-neutral-500 dark:text-neutral-400">

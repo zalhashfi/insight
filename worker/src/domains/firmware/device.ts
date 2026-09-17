@@ -16,7 +16,7 @@ async function deviceIdFor(c: OtaContext, projectId: string, seen = true) {
   const device = await resolveDevice(
     c.env,
     projectId,
-    normaliseDeviceKey(c.req.header('x-nodrix-device')),
+    normaliseDeviceKey(c.req.header('x-insight-device') ?? c.req.header('x-nodrix-device')),
     Math.floor(Date.now() / 1000)
   );
   if (device && seen) c.executionCtx.waitUntil(touchDevice(c.env, device.id));
@@ -28,13 +28,13 @@ ota.get('/', async (c) => {
   const { project_id } = c.get('projectToken');
   // An HTTP-mode board has no hello frame, so this is where it reports what it
   // runs — without it a finished update is offered again forever.
-  const firmware = c.req.header('x-nodrix-firmware') ?? null;
+  const firmware = c.req.header('x-insight-firmware') ?? c.req.header('x-nodrix-firmware') ?? null;
   const deviceId = await deviceIdFor(c, project_id, !firmware);
   if (!deviceId) return c.json({ update: null });
 
   if (firmware) {
     c.executionCtx.waitUntil(
-      recordDeviceSeen(c.env, deviceId, c.req.header('x-nodrix-chip'), firmware)
+      recordDeviceSeen(c.env, deviceId, c.req.header('x-insight-chip') ?? c.req.header('x-nodrix-chip'), firmware)
         .then(() => reconcile(c.env, deviceId, firmware))
     );
   }

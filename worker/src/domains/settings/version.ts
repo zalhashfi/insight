@@ -16,7 +16,7 @@ const version = new Hono<{ Bindings: Env; Variables: UserContextVars }>();
 
 version.use('*', requireSession);
 
-const DEFAULT_UPSTREAM = 'zalhashfi/nodrix';
+const DEFAULT_UPSTREAM = 'zalhashfi/insight';
 // Branch tracked on the edge channel (the project's default branch).
 const DEFAULT_BRANCH = 'master';
 // Cache is served as-is for FRESH seconds; the entry (with its ETag) is kept in
@@ -170,7 +170,7 @@ async function getCachedUpstream(env: Env, repo: string): Promise<CachedPayload 
 // GET /v1/admin/version — current + upstream + compare URL.
 // Owner OR admin (this is informational, not destructive).
 version.get('/', async (c) => {
-  const upstreamRepo = (c.env.NODRIX_UPSTREAM_REPO ?? DEFAULT_UPSTREAM).trim() || DEFAULT_UPSTREAM;
+  const upstreamRepo = (c.env.INSIGHT_UPSTREAM_REPO ?? DEFAULT_UPSTREAM).trim() || DEFAULT_UPSTREAM;
 
   const current = {
     version: VERSION,

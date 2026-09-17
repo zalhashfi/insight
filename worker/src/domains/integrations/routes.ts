@@ -1,7 +1,7 @@
 import { Hono } from 'hono';
 import { z } from 'zod';
 import type { Env } from '../../env';
-import { INTEGRATION_KINDS } from '@nodrix/integrations-shared';
+import { INTEGRATION_KINDS } from '@insight/integrations-shared';
 import { requireSession } from '../../platform/middleware/require-session';
 import { resolveProject, type ProjectContextVars } from '../../platform/middleware/resolve-project';
 import { recordAudit } from '../../platform/lib/audit';

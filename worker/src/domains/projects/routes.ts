@@ -1,12 +1,14 @@
-import { Hono } from 'hono';
+import { Hono, type Context } from 'hono';
 import type { Env } from '../../env';
 import { requireSession, type UserContextVars } from '../../platform/middleware/require-session';
 import { recordAudit } from '../../platform/lib/audit';
 import { userCanAccessProject } from '../../platform/lib/roles';
 import { projectStub } from '../../platform/durable-objects/stubs';
 import { exportProject } from './export';
+import { exportCsv, type CsvExportOptions } from './export-csv';
 import { createProject, updateProject, listAccessibleProjects } from './service';
-import { actorFromSession, serviceErrorResponse } from '../../platform/lib/service';
+import { listDevices } from '../devices/service';
+import { actorFromSession, ServiceError, serviceErrorResponse } from '../../platform/lib/service';
 
 const projects = new Hono<{ Bindings: Env; Variables: UserContextVars }>();
 
@@ -75,6 +77,80 @@ projects.get('/:proj/export', async (c) => {
     },
   });
 });
+
+// Telemetry history as CSV, for a chosen range, variable set and device. Reads
+// R2 directly rather than the DO: the ring buffer only holds an hour.
+projects.get('/:proj/export.csv', async (c) => {
+  const projId = c.req.param('proj');
+  const user = c.get('user');
+  if (!(await userCanAccessProject(c.env, user.id, projId))) return c.json({ error: 'forbidden' }, 403);
+
+  try {
+    const opts = await parseExportQuery(c, projId);
+    await recordAudit(c.env, {
+      projectId: projId,
+      userId: user.id,
+      action: 'project.export',
+      targetType: 'project',
+      targetId: projId,
+      metadata: {
+        format: opts.format,
+        from: opts.from,
+        to: opts.to,
+        variables: opts.variables?.length ?? 0,
+      },
+    });
+
+    const safeId = projId.replace(/[^A-Za-z0-9_-]/g, '');
+    return new Response(exportCsv(c.env, projId, opts), {
+      headers: {
+        'Content-Type': 'text/csv; charset=utf-8',
+        'Content-Disposition': `attachment; filename="${safeId}.csv"`,
+        'Cache-Control': 'no-store',
+      },
+    });
+  } catch (e) {
+    return serviceErrorResponse(c, e);
+  }
+});
+
+// Throws ServiceError so the handler's single catch turns every rejection into a
+// clean 4xx. The range ceiling lives in hourBucketsBetween, which the export
+// itself calls.
+async function parseExportQuery(
+  c: Context<{ Bindings: Env; Variables: UserContextVars }>,
+  projId: string
+): Promise<CsvExportOptions> {
+  const now = Math.floor(Date.now() / 1000);
+  const to = c.req.query('to') ? Number(c.req.query('to')) : now;
+  const from = c.req.query('from') ? Number(c.req.query('from')) : to - 86400;
+  if (!Number.isInteger(from) || !Number.isInteger(to) || from >= to) {
+    throw new ServiceError('bad_request', 'from must be an integer before to', 'invalid_range');
+  }
+
+  const format = c.req.query('format') ?? 'long';
+  if (format !== 'long' && format !== 'wide') {
+    throw new ServiceError('bad_request', 'format must be long or wide', 'invalid_format');
+  }
+
+  const varsRaw = c.req.query('vars');
+  const variables = varsRaw
+    ? [...new Set(varsRaw.split(',').map((v) => v.trim()).filter(Boolean))].slice(0, 250)
+    : null;
+
+  let deviceId: string | null = null;
+  let deviceIsDefault = false;
+  const deviceRaw = c.req.query('device');
+  if (deviceRaw) {
+    const device = (await listDevices(c.env, projId)).find((d) => d.id === deviceRaw);
+    if (!device) throw new ServiceError('not_found', 'no such device', 'unknown_device');
+    deviceId = device.id;
+    // The default device's rows carry a null device in R2.
+    deviceIsDefault = device.is_default === 1;
+  }
+
+  return { from, to, variables, deviceId, deviceIsDefault, format };
+}
 
 // Cascade: wipes the project's Project DO (which owns R2 telemetry history, not
 // covered by D1 FK cascade), then deletes the D1 row — which cascades dashboards,

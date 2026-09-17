@@ -10,4 +10,4 @@ if (!fs.existsSync(path.join(process.cwd(), 'scripts', 'gen-version.ts'))) {
 
 execSync('bun scripts/gen-version.ts', { stdio: 'inherit' });
 execSync('bun scripts/gen-migrations.ts', { stdio: 'inherit' });
-execSync('bun run --filter @nodrix/web build', { stdio: 'inherit' });
+execSync('bun run --filter @insight/web build', { stdio: 'inherit' });

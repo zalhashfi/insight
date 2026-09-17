@@ -85,7 +85,7 @@ function stamp(at: number) {
       Android. Safari and Firefox don't support it. It also needs a secure (HTTPS) connection.
     </p>
     <p class="mt-2 text-sm text-neutral-600 dark:text-neutral-400">
-      Everything else in nodrix works here — this page is the only part that needs direct USB access.
+      Everything else in INSIGHT works here — this page is the only part that needs direct USB access.
     </p>
   </div>
 
@@ -135,7 +135,7 @@ function stamp(at: number) {
     </div>
 
     <p v-if="garbled" class="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
-      This looks like the wrong baud rate. Most nodrix sketches use 115200.
+      This looks like the wrong baud rate. Most INSIGHT sketches use 115200.
     </p>
 
     <p v-if="lastError" class="text-xs text-red-600 dark:text-red-400">{{ lastError }}</p>

@@ -3,7 +3,7 @@ import { computed, ref, watch } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { VueFlow, useVueFlow, type Connection, type Edge } from '@vue-flow/core';
 import '@vue-flow/core/dist/style.css';
-import { graphError } from '@nodrix/blocks-shared';
+import { graphError } from '@insight/blocks-shared';
 import { useProjectStore } from '../../../stores/project';
 import { useUiStore } from '../../../stores/ui';
 import { toast } from '../../../lib/toast';
@@ -285,9 +285,9 @@ async function save() {
 /* Animate the live connection line (while dragging) like committed edges. */
 :deep(.vue-flow__connection-path) {
   stroke-dasharray: 5;
-  animation: nodrix-dash 0.5s linear infinite;
+  animation: insight-dash 0.5s linear infinite;
 }
-@keyframes nodrix-dash {
+@keyframes insight-dash {
   to { stroke-dashoffset: -10; }
 }
 </style>

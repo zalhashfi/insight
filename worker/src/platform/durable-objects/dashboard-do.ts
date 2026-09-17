@@ -78,7 +78,7 @@ export class DashboardDO extends DurableObject<Env> {
     // Stash the authenticated user id (set by the WS route after auth) so control
     // frames can be re-authorized against the user's current project role — this
     // makes a live demotion take effect on an already-open socket.
-    const uid = request.headers.get('x-nodrix-uid');
+    const uid = request.headers.get('x-insight-uid') ?? request.headers.get('x-nodrix-uid');
     if (uid) server.serializeAttachment({ userId: uid });
 
     // Reconnecting clients pass ?since=<last applied ts> to resume with a delta.

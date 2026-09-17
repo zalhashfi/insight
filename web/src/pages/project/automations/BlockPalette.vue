@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref } from 'vue';
-import { TRIGGER_CATALOG, CONDITION_CATALOG, ACTION_CATALOG, type BlockManifest } from '@nodrix/blocks-shared';
+import { TRIGGER_CATALOG, CONDITION_CATALOG, ACTION_CATALOG, type BlockManifest } from '@insight/blocks-shared';
 import Icon from '../../../components/Icon.vue';
 
 // `open` drives the off-canvas drawer below lg; on lg+ the palette is a static

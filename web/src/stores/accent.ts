@@ -16,8 +16,8 @@ export const ACCENTS = [
 
 export type Accent = (typeof ACCENTS)[number];
 
-const STORAGE_KEY = 'nodrix:accent';
-const DEFAULT: Accent = 'orange';
+const STORAGE_KEY = 'insight:accent';
+const DEFAULT: Accent = 'blue';
 
 function readStored(): Accent {
   const v = localStorage.getItem(STORAGE_KEY);

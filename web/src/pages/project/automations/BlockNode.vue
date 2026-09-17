@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { computed } from 'vue';
 import { Handle, Position } from '@vue-flow/core';
-import { connSpec } from '@nodrix/integrations-shared';
-import { blockLines } from '@nodrix/blocks-shared';
+import { connSpec } from '@insight/integrations-shared';
+import { blockLines } from '@insight/blocks-shared';
 import Icon from '../../../components/Icon.vue';
 import { useProjectStore } from '../../../stores/project';
 import { blockOf, type BlockData } from './graph-edit';

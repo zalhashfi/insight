@@ -98,7 +98,7 @@ async function submit() {
         <p class="mt-1 text-sm text-neutral-600 dark:text-neutral-400">
           <span v-if="preview.inviter_email">{{ preview.inviter_email }} invited </span>
           <span v-else>You've been invited </span>
-          to join this nodrix deployment as <span class="font-medium">{{ roleLabel }}</span>.
+          to join this INSIGHT deployment as <span class="font-medium">{{ roleLabel }}</span>.
         </p>
 
         <form class="mt-5 space-y-3" @submit.prevent="submit">

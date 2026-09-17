@@ -1,6 +1,6 @@
 // Shared types used across stores, pages, and widgets.
 
-import type { AutomationGraph, GraphNode, GraphEdge } from '@nodrix/blocks-shared';
+import type { AutomationGraph, GraphNode, GraphEdge } from '@insight/blocks-shared';
 export type { AutomationGraph, GraphNode, GraphEdge };
 
 export type InstanceRole = 'owner' | 'admin' | 'member';
@@ -114,8 +114,8 @@ export type UserToken = {
   expires_at?: number | null;
 };
 
-export type { WidgetType } from '@nodrix/widgets-shared';
-import type { WidgetType as _WT } from '@nodrix/widgets-shared';
+export type { WidgetType } from '@insight/widgets-shared';
+import type { WidgetType as _WT } from '@insight/widgets-shared';
 
 export type WidgetInstance = {
   id: string;
@@ -142,7 +142,11 @@ export type Layout = {
   // Public-view auto-refresh cadence in seconds. Owner-set, server-clamped, and
   // delivered via the API (never a URL param) so viewers can't override it.
   refresh?: number;
+  // Optional embed presentation settings (persisted per dashboard).
+  embed?: { bg: string } | null;
 };
+
+export const EMBED_BG_RE = /^(#[0-9a-fA-F]{6}|transparent)$/;
 
 export type DashboardMeta = {
   id: string;
@@ -251,8 +255,8 @@ export type Automation = {
 
 // Sourced from the shared packages; re-exported so '../types' imports keep working.
 // (GraphNode/GraphEdge/AutomationGraph are imported + re-exported at the top.)
-export type { IntegrationKind, Integration } from '@nodrix/integrations-shared';
-export type { IntegrationResult as IntegrationTestResult } from '@nodrix/integrations-shared';
+export type { IntegrationKind, Integration } from '@insight/integrations-shared';
+export type { IntegrationResult as IntegrationTestResult } from '@insight/integrations-shared';
 
 export type AuditLogEntry = {
   id: number;

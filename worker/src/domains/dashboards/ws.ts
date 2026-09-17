@@ -31,7 +31,7 @@ ws.get('/:dashboard', async (c) => {
   // Forward to the DO with the authenticated user id stashed in a header so the
   // DO can re-check project access per control frame (handles live removal).
   const headers = new Headers(c.req.raw.headers);
-  headers.set('x-nodrix-uid', user.id);
+  headers.set('x-insight-uid', user.id);
   const fwd = new Request(c.req.raw.url, {
     method: c.req.raw.method,
     headers,

@@ -7,6 +7,7 @@ import { projectStub } from '../../platform/durable-objects/stubs';
 import { recordAudit } from '../../platform/lib/audit';
 import { serviceErrorResponse } from '../../platform/lib/service';
 import { publishBuild } from './ota';
+import { agentRepo } from './agent-config';
 
 const MAX_SKETCH_BYTES = 256 * 1024;
 const MAX_ARTIFACT_BYTES = 8 * 1024 * 1024;
@@ -52,7 +53,7 @@ export async function agentWsHandler(c: Context<{ Bindings: Env }>): Promise<Res
   const stub = projectStub(c.env, projectId);
   await stub.setProjectId(projectId);
   return stub.fetch(
-    new Request(c.req.raw, { headers: { ...Object.fromEntries(c.req.raw.headers), 'x-nodrix-role': 'agent' } })
+    new Request(c.req.raw, { headers: { ...Object.fromEntries(c.req.raw.headers), 'x-insight-role': 'agent' } })
   );
 }
 
@@ -80,6 +81,9 @@ const build = new Hono<{ Bindings: Env; Variables: ProjectContextVars }>();
 build.use('*', requireSession);
 build.use('*', resolveProject);
 
+// Which repo the Code page should offer the agent from. Readable by any member
+// (the page renders for them too); the agent itself still needs owner/admin.
+build.get('/config', async (c) => c.json({ agent_repo: await agentRepo(c.env) }));
 build.post('/', async (c) => {
   const user = c.get('user');
   if (user.role !== 'owner' && user.role !== 'admin') return c.json({ error: 'forbidden' }, 403);

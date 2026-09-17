@@ -2,12 +2,11 @@
 
 ## Reporting a vulnerability
 
-If you believe you've found a security vulnerability in nodrix, please report it
+If you believe you've found a security vulnerability in INSIGHT, please report it
 **privately** — do not open a public issue.
 
 - **Preferred:** use GitHub's private vulnerability reporting on this repository
   (the **Security** tab → **Report a vulnerability**).
-- **Or email:** hello@nodrix.live.
 
 Please include:
 

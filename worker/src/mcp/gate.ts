@@ -7,7 +7,7 @@ import type { Context } from 'hono';
 import type { Env } from '../env';
 import { extractBearer, lookupUserToken, touchTokenLastUsed } from '../platform/lib/tokens';
 import { mcpEnabled } from './flags';
-import { NodrixMcpAgent } from './agent';
+import { InsightMcpAgent } from './agent';
 import type { ActorRole } from '../platform/lib/service';
 
 export type McpProps = {
@@ -44,7 +44,7 @@ export function touchToken(env: Env, tokenId: string): Promise<void> {
   return touchTokenLastUsed(env, 'user', tokenId);
 }
 
-const mcpHandler = NodrixMcpAgent.serve('/v1/mcp');
+const mcpHandler = InsightMcpAgent.serve('/v1/mcp');
 
 // Bearer MCP endpoint (mounted at /v1/mcp): authenticate, then hand off to the
 // per-session agent DO with the resolved props. (OAuth-auth MCP is on
@@ -54,7 +54,10 @@ export async function mcpBearerHandler(c: Context<{ Bindings: Env }>): Promise<R
   if (auth instanceof Response) return auth;
   c.executionCtx.waitUntil(touchToken(c.env, auth.tokenId));
   (c.executionCtx as unknown as { props?: unknown }).props = auth;
-  return mcpHandler.fetch(c.req.raw, c.env, c.executionCtx);
+
+  // Hono declares its own ExecutionContext (no `tracing`); Cloudflare's runtime
+  // object is the real one, so pass it through the SDK's expectation.
+  return mcpHandler.fetch(c.req.raw, c.env, c.executionCtx as unknown as ExecutionContext<unknown>);
 }
 
 function json(body: unknown, status: number): Response {

@@ -6,7 +6,7 @@
 // manual-run endpoint, and /v1/events. `set_variable` differs by caller (DO binds
 // addControl; the worker routes to the PROJECT_DO stub), so it's injectable via deps.
 
-import { VALID_ACTION_KINDS, VALID_CONDITION_KINDS } from '@nodrix/blocks-shared';
+import { VALID_ACTION_KINDS, VALID_CONDITION_KINDS } from '@insight/blocks-shared';
 import type { Env } from '../../env';
 import { newId } from '../lib/ids';
 import { recordAudit } from '../lib/audit';

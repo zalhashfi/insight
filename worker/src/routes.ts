@@ -49,7 +49,7 @@ type App = Hono<{ Bindings: Env }>;
 export function registerRoutes(app: App): void {
   // System / meta
   app.get('/healthz', (c) => c.json({ ok: true }));
-  app.get('/v1/version', (c) => c.json({ name: 'nodrix', version: '0.0.0' }));
+  app.get('/v1/version', (c) => c.json({ name: 'insight', version: '1.0.1' }));
   app.get('/v1/public/bootstrap-status', async (c) => {
     const row = await c.env.DB.prepare(`SELECT 1 AS one FROM users LIMIT 1`).first<{ one: number }>();
     return c.json({ bootstrap: row === null });

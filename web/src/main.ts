@@ -2,7 +2,7 @@ import { createApp } from 'vue';
 import { createPinia } from 'pinia';
 import App from './App.vue';
 import { router } from './router';
-import { registerWidgets } from '@nodrix/widgets-shared/registry';
+import { registerWidgets } from '@insight/widgets-shared/registry';
 import { onUnauthorized } from './api';
 import { progress } from './lib/progress';
 import { useThemeStore } from './stores/theme';
@@ -32,7 +32,7 @@ router.beforeEach((_to, _from, next) => {
 router.afterEach((to) => {
   progress.done();
   const title = to.meta['title'] as string | undefined;
-  document.title = title ? `${title} · nodrix` : 'nodrix — your own IoT cloud, on Cloudflare';
+  document.title = title ? `${title} · INSIGHT` : 'INSIGHT — your own IoT cloud, on Cloudflare';
 });
 router.onError(() => {
   progress.done();

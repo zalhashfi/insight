@@ -1,6 +1,6 @@
 // Web adapter for automation display: trigger picker/header metadata and the
 // summary chips shown on cards. All per-kind formatting lives in
-// @nodrix/blocks-shared; this file only adapts it to the web (resolvers) and the
+// @insight/blocks-shared; this file only adapts it to the web (resolvers) and the
 // legacy trigger_type/actions shape.
 
 import {
@@ -8,7 +8,7 @@ import {
   blockLines,
   blockChip,
   type SummaryResolvers,
-} from '@nodrix/blocks-shared';
+} from '@insight/blocks-shared';
 import type { AutomationTriggerType } from '../../../types';
 
 export type TriggerSpec = {

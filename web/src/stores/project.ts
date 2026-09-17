@@ -92,6 +92,33 @@ export const useProjectStore = defineStore('project', () => {
     await loadFirmware();
   }
 
+  async function uploadFirmware(
+    file: File,
+    version: string,
+    notes?: string,
+    target?: string
+  ): Promise<Firmware> {
+    const pid = requireProjectId();
+    const form = new FormData();
+    form.set('file', file);
+    form.set('version', version);
+    if (notes) form.set('notes', notes);
+    if (target) form.set('target', target);
+
+    const res = await fetch(`/v1/admin/projects/${pid}/firmware/upload`, {
+      method: 'POST',
+      body: form,
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      const err = (await res.json().catch(() => null)) as { reason?: string; error?: string } | null;
+      throw new Error(err?.reason || err?.error || `Upload failed: ${res.status}`);
+    }
+    const data = (await res.json()) as { firmware: Firmware };
+    await loadFirmware();
+    return data.firmware;
+  }
+
   async function deleteFirmware(id: string): Promise<void> {
     const pid = requireProjectId();
     await api.del(`/v1/admin/projects/${pid}/firmware/${id}`);
@@ -440,6 +467,7 @@ export const useProjectStore = defineStore('project', () => {
     loadDevices,
     loadFirmware,
     publishBuild,
+    uploadFirmware,
     deleteFirmware,
     assignFirmware,
     renameDevice,
