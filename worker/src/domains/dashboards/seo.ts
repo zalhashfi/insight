@@ -45,12 +45,12 @@ export async function serveDashboardSeo(env: Env, req: Request, token: string): 
   if (!meta) return res; // unknown/private token → default meta; SPA renders its 404
 
   const name = meta.name.trim() || 'Dashboard';
-  const title = `${name} · nodrix`;
+  const title = `${name} · INSIGHT`;
   // Description falls back: dashboard → project → generic.
   const description = (
     meta.description?.trim() ||
     meta.project_description?.trim() ||
-    `Live "${name}" dashboard on nodrix.`
+    `Live "${name}" dashboard on INSIGHT.`
   ).slice(0, 200);
   const shareUrl = `${new URL(req.url).origin}/share/${token}`;
 

@@ -184,21 +184,20 @@ const initials = computed(() => {
           <path d="M6 6l12 12M18 6 6 18" />
         </svg>
       </button>
-      <!-- Collapsed: white logo on a dark square -->
+      <!-- Collapsed: brand mark -->
       <div
         v-if="ui.sidebarRailed"
-        class="grid h-9 w-9 shrink-0 place-items-center rounded-md bg-neutral-900 dark:bg-neutral-800"
+        class="grid h-9 w-9 shrink-0 place-items-center rounded-md bg-neutral-900 text-xs font-bold text-white dark:bg-neutral-800"
       >
-        <img src="/white_logo.png" alt="INSIGHT" class="h-6 w-6 object-contain" />
+        I
       </div>
-      <!-- Expanded: bind src to the active theme so only one variant downloads
-           (CSS `hidden` would still fetch both). -->
-      <img
+      <!-- Expanded: brand text -->
+      <div
         v-else
-        :src="theme.resolved === 'dark' ? '/white_logo.png' : '/dark_logo.png'"
-        alt="INSIGHT"
-        class="h-7 w-auto"
-      />
+        class="h-7 text-lg font-bold tracking-tight text-neutral-900 dark:text-neutral-100"
+      >
+        INSIGHT
+      </div>
     </div>
 
     <!-- Project switcher -->

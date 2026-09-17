@@ -216,7 +216,7 @@ function download() {
 
     <p v-if="!supported" class="rounded-md bg-amber-50 px-3 py-2 text-xs text-amber-800 dark:bg-amber-950/40 dark:text-amber-300">
       Flashing and the serial monitor need Web Serial — Chrome, Edge or Opera on desktop, or Chrome on
-      Android. Everything else in nodrix works here.
+      Android. Everything else in INSIGHT works here.
     </p>
 
     <div class="min-h-0 flex-1">
@@ -254,7 +254,7 @@ function download() {
         <div v-if="noAgent" class="rounded-lg border border-amber-300 bg-amber-50 p-3 dark:border-amber-900 dark:bg-amber-950/40">
           <p class="text-sm font-semibold text-amber-900 dark:text-amber-200">No agent is running</p>
           <p class="mt-1 text-xs text-amber-900/80 dark:text-amber-200/80">
-            Compiling needs a C++ toolchain, which a browser can't run. The nodrix agent does it on
+            Compiling needs a C++ toolchain, which a browser can't run. The INSIGHT agent does it on
             your machine and sends the binary back. It never touches the serial port — this page keeps
             doing the flashing.
           </p>

@@ -130,7 +130,7 @@ async function load() {
     name.value = d.name;
     description.value = d.description;
     // Router's afterEach resets the title on navigation away, so no restore.
-    if (!isEmbed.value) document.title = `${d.name} · nodrix`;
+    if (!isEmbed.value) document.title = `${d.name} · INSIGHT`;
     layout = d.layout;
     itemCount.value = d.layout.items.length;
     refreshSecs.value = d.layout.refresh ?? 5; // server-clamped
