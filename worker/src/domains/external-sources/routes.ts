@@ -33,7 +33,7 @@ const baseSchema = z.object({
   headers: z.record(z.string().max(128), z.string().max(1024)),
   enabled: z.boolean(),
 });
-const createSchema = baseSchema;
+const createSchema = baseSchema.partial().required({ name: true, url: true, device_key: true, fields: true });
 const updateSchema = baseSchema.partial();
 
 const externalSources = new Hono<{ Bindings: Env; Variables: ProjectContextVars }>();
@@ -135,7 +135,7 @@ externalSources.patch('/:id', async (c) => {
     const project = c.get('project');
     const actor = actorFromSession(c.get('user'));
     const body = await parseBody(c, updateSchema);
-    const src = await updateSource(c.env, actor, project.id, c.req.param('id'), body);
+    const src = await updateSource(c.env, actor, project.id, c.req.param('id'), body as Parameters<typeof updateSource>[4]);
     c.executionCtx.waitUntil(rescheduleScheduler(c.env));
     return c.json({ external_source: src });
   } catch (e) {

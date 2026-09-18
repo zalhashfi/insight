@@ -349,10 +349,10 @@ export type FetchOutcome =
   | { ok: false; error: string; detail?: string };
 
 async function fetchJson(url: string, headers: Record<string, string>): Promise<FetchOutcome> {
-  const merged: Record<string, string> = { Accept: 'application/json', 'User-Agent': 'insight-external-poll', ...headers };
+  const merged: Record<string, string> = { Accept: 'application/json', 'User-Agent': 'insight-external-poll', 'Cache-Control': 'no-store', ...headers };
   let res: Response;
   try {
-    res = await fetch(url, { headers: merged, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS) });
+    res = await fetch(url, { headers: merged, signal: AbortSignal.timeout(FETCH_TIMEOUT_MS), cf: { cacheTtl: 0 } });
   } catch (e) {
     return { ok: false, error: 'fetch_failed', detail: String(e).slice(0, 500) };
   }
@@ -388,12 +388,14 @@ export async function previewSource(
   const resolved = resolveEnvelope(fetched.body, input.envelope_path ?? '');
   if (!resolved.ok) return resolved;
   const total = resolved.records.length;
-  const records = resolved.records.slice(-5);
+  const allKeys = new Set<string>();
+  for (const r of resolved.records) for (const k of Object.keys(r)) allKeys.add(k);
+  const cursorGuess = allKeys.has('id') ? 'id' : allKeys.has('created_at') ? 'created_at' : Object.keys(resolved.records[0] ?? {})[0] ?? 'id';
+  const ordered = [...resolved.records].sort((a, b) => compareCursor(a[cursorGuess], b[cursorGuess]));
+  const records = ordered.slice(-5);
   const fields = inferFields(records);
   const sentinels = input.sentinel_map ?? SENTINEL_DEFAULT;
-  const keys = new Set<string>();
-  for (const r of records) for (const k of Object.keys(r)) keys.add(k);
-  const suggested = keys.has('id') ? 'id' : keys.has('created_at') ? 'created_at' : (fields[0]?.key ?? 'id');
+  const suggested = cursorGuess;
   return {
     ok: true,
     total,

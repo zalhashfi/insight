@@ -223,6 +223,29 @@ async function save() {
       </table>
     </div>
 
+    <div v-if="preview && preview.records.length" class="mt-3">
+      <h4 class="mb-1.5 text-xs font-semibold text-neutral-700 dark:text-neutral-300">
+        Last {{ preview.records.length }} records (newest last, sorted by {{ preview.suggested_cursor }})
+      </h4>
+      <div class="overflow-x-auto rounded-lg border border-neutral-200 dark:border-neutral-800">
+        <table class="w-full text-left font-mono text-[11px]">
+          <thead>
+            <tr class="border-b border-neutral-200 bg-neutral-50 dark:border-neutral-800 dark:bg-neutral-950">
+              <th v-for="f in preview.fields.slice(0, 6)" :key="f.key" class="px-2 py-1.5 font-semibold">{{ f.key }}</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr v-for="(r, i) in preview.records" :key="i" class="border-b border-neutral-100 last:border-0 dark:border-neutral-800/60">
+              <td v-for="f in preview.fields.slice(0, 6)" :key="f.key" class="max-w-32 truncate px-2 py-1.5">{{ String((r as Record<string, unknown>)[f.key] ?? '') }}</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="mt-1 text-[11px] text-neutral-500 dark:text-neutral-400">
+        Compare the bottom row (newest, {{ preview.total }} total) with your browser tab to validate freshness.
+      </p>
+    </div>
+
     <div class="mt-3 flex items-center gap-2">
       <button
         type="button"
@@ -237,4 +260,3 @@ async function save() {
       >Cancel</button>
     </div>
   </div>
-</template>
