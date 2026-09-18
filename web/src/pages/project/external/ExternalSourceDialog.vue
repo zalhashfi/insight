@@ -174,12 +174,12 @@ async function save() {
       </label>
       <label class="block sm:col-span-2">
         <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">Sentinels (JSON, INVALID badge only, values still stored)</span>
-        <textarea v-model="sentinelText" rows="3" spellcheck="false" placeholder='{"temperature": [-1, "-1.00"]}' class="mt-1 w-full rounded-md border border-neutral-300 bg-white px-2.5 py-1.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950" />
+        <textarea v-model="sentinelText" rows="3" spellcheck="false" placeholder='{"temperature": [-1, "-1.00"]}' class="mt-1 w-full rounded-md border border-neutral-300 bg-white px-2.5 py-1.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950"></textarea>
         <span v-if="sentinelError" class="mt-1 block text-xs text-red-600 dark:text-red-400">{{ sentinelError }}</span>
       </label>
       <label v-if="!isEdit" class="block sm:col-span-2">
         <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">Headers (JSON, optional, e.g. API key)</span>
-        <textarea v-model="headersText" rows="2" spellcheck="false" placeholder='{"authorization": "Bearer …"}' class="mt-1 w-full rounded-md border border-neutral-300 bg-white px-2.5 py-1.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950" />
+        <textarea v-model="headersText" rows="2" spellcheck="false" placeholder='{"authorization": "Bearer …"}' class="mt-1 w-full rounded-md border border-neutral-300 bg-white px-2.5 py-1.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950"></textarea>
         <span v-if="headersError" class="mt-1 block text-xs text-red-600 dark:text-red-400">{{ headersError }}</span>
       </label>
     </div>
@@ -236,7 +236,7 @@ async function save() {
           </thead>
           <tbody>
             <tr v-for="(r, i) in preview.records" :key="i" class="border-b border-neutral-100 last:border-0 dark:border-neutral-800/60">
-              <td v-for="f in preview.fields.slice(0, 6)" :key="f.key" class="max-w-32 truncate px-2 py-1.5">{{ String((r as Record<string, unknown>)[f.key] ?? '') }}</td>
+              <td v-for="f in preview.fields.slice(0, 6)" :key="f.key" class="max-w-32 truncate px-2 py-1.5">{{ String(r[f.key] ?? '') }}</td>
             </tr>
           </tbody>
         </table>
@@ -260,3 +260,5 @@ async function save() {
       >Cancel</button>
     </div>
   </div>
+
+</template>
