@@ -173,12 +173,12 @@ async function save() {
         <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">Enabled</span>
       </label>
       <label class="block sm:col-span-2">
-        <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">Sentinels (JSON — INVALID badge only, values still stored)</span>
+        <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">Sentinels (JSON, INVALID badge only, values still stored)</span>
         <textarea v-model="sentinelText" rows="3" spellcheck="false" placeholder='{"temperature": [-1, "-1.00"]}' class="mt-1 w-full rounded-md border border-neutral-300 bg-white px-2.5 py-1.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950" />
         <span v-if="sentinelError" class="mt-1 block text-xs text-red-600 dark:text-red-400">{{ sentinelError }}</span>
       </label>
       <label v-if="!isEdit" class="block sm:col-span-2">
-        <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">Headers (JSON, optional — e.g. API key)</span>
+        <span class="text-xs font-medium text-neutral-600 dark:text-neutral-300">Headers (JSON, optional, e.g. API key)</span>
         <textarea v-model="headersText" rows="2" spellcheck="false" placeholder='{"authorization": "Bearer …"}' class="mt-1 w-full rounded-md border border-neutral-300 bg-white px-2.5 py-1.5 font-mono text-xs dark:border-neutral-700 dark:bg-neutral-950" />
         <span v-if="headersError" class="mt-1 block text-xs text-red-600 dark:text-red-400">{{ headersError }}</span>
       </label>
@@ -216,7 +216,7 @@ async function save() {
             <td class="max-w-48 truncate px-2 py-1.5">{{ String(f.sample) }}</td>
             <td class="px-2 py-1.5">
               <span v-if="fieldInvalid(f)" class="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-800 dark:bg-amber-950/50 dark:text-amber-300">INVALID</span>
-              <span v-else class="text-neutral-400">—</span>
+              <span v-else class="text-neutral-400">ok</span>
             </td>
           </tr>
         </tbody>

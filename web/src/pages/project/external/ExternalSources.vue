@@ -11,11 +11,28 @@ const project = useProjectStore();
 const dialogOpen = ref(false);
 const editing = ref<ExternalSource | null>(null);
 const runningId = ref<string | null>(null);
-
 const EMPTY_ICON = 'M13.19 8.688a4.5 4.5 0 0 1 1.242 7.244l-4.5 4.5a4.5 4.5 0 0 1-6.364-6.364l1.757-1.757m13.35-.622 1.757-1.757a4.5 4.5 0 0 0-6.364-6.364l-4.5 4.5a4.5 4.5 0 0 0 1.242 7.244';
+const loading = ref(true);
+const loadError = ref<string | null>(null);
+
+async function reload() {
+  loading.value = true;
+  loadError.value = null;
+  try {
+    await project.loadExternalSources();
+  } catch (e) {
+    loadError.value = (e as Error).message;
+  } finally {
+    loading.value = false;
+  }
+}
+
+function retryLoad() {
+  void reload();
+}
 
 onMounted(() => {
-  project.loadExternalSources().catch(() => {});
+  void reload();
 });
 
 function openCreate() {
@@ -62,7 +79,7 @@ async function pollNow(s: ExternalSource) {
   try {
     const res = await project.runExternalSourceNow(s.id);
     if (res.status === 'ok' && res.detail === 'no_new_data') {
-      toast.success('No new data — already up to date');
+      toast.success('No new data, already up to date');
     } else {
       toast.success(`Polled ${res.points ?? 0} variable(s)`);
     }
@@ -114,7 +131,19 @@ async function removeSource(s: ExternalSource) {
       @cancel="closeDialog"
     />
 
-    <div v-if="project.externalSources.length" class="space-y-3">
+    <div v-if="loading" class="space-y-3" aria-busy="true">
+      <div class="animate-pulse rounded-xl border border-neutral-200 bg-white p-4 dark:border-neutral-800 dark:bg-neutral-900">
+        <div class="h-4 w-1/3 rounded bg-neutral-200 dark:bg-neutral-800"></div>
+        <div class="mt-2 h-3 w-2/3 rounded bg-neutral-100 dark:bg-neutral-800/60"></div>
+      </div>
+      <p class="text-xs text-neutral-500 dark:text-neutral-400">Loading external sources…</p>
+    </div>
+    <div v-else-if="loadError" class="rounded-xl border border-red-300 bg-red-50 p-4 dark:border-red-900 dark:bg-red-950/30">
+      <p class="text-xs font-semibold text-red-700 dark:text-red-300">Could not load external sources</p>
+      <p class="mt-1 text-xs text-red-600 dark:text-red-400">{{ loadError }}</p>
+      <button type="button" class="mt-2 rounded-md border border-red-300 px-2.5 py-1.5 text-xs font-medium text-red-700 hover:bg-red-100 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-900/40" @click="retryLoad">Try again</button>
+    </div>
+    <div v-else-if="project.externalSources.length" class="space-y-3">
       <div
         v-for="s in project.externalSources"
         :key="s.id"
@@ -162,7 +191,7 @@ async function removeSource(s: ExternalSource) {
       </div>
       <h2 class="text-sm font-semibold text-neutral-900 dark:text-neutral-100">No external sources yet</h2>
       <p class="mx-auto mt-1 max-w-md text-xs text-neutral-500 dark:text-neutral-400">
-        Add a JSON URL — e.g. https://biru-langit.com/api/TULT/2m — test it, tick the fields, and the worker polls it into a device.
+        Add a JSON URL (e.g. https://biru-langit.com/api/TULT/2m), test it, tick the fields, and the worker polls it into a device.
       </p>
     </div>
   </div>
