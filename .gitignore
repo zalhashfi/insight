@@ -4,3 +4,16 @@ dist/
 .dev.vars
 *.log
 .DS_Store
+# planning is confidential — never commit
+.planning/
+**/.planning/
+# env & secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+# deps & build
+.pio/
+__pycache__/
+.pytest_cache/
