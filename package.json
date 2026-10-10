@@ -1,0 +1,20 @@
+{
+  "name": "insight",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "packageManager": "bun@1.4.2",
+  "workspaces": [
+    "worker"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240909.0",
+    "hono": "^4.5.11",
+    "typescript": "^5.5.4",
+    "vitest": "^2.1.9"
+  }
+}
