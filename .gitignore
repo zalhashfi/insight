@@ -1,19 +1,23 @@
-node_modules/
-dist/
-.wrangler/
-.dev.vars
-*.log
-.DS_Store
 # planning is confidential — never commit
 .planning/
 **/.planning/
+
 # env & secrets
 .env
 .env.*
 !.env.example
+.dev.vars
 *.pem
 *.key
+
 # deps & build
+node_modules/
+dist/
+.wrangler/
 .pio/
 __pycache__/
 .pytest_cache/
+
+# misc
+*.log
+.DS_Store
