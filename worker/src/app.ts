@@ -836,6 +836,9 @@ function mountM4(app: App, deps: AppDeps): void {
           secret: isPlainObject(body.secret)
             ? (body.secret as Readonly<Record<string, SecretValue>>)
             : undefined,
+          // A live transport is required by the input type but is ALWAYS
+          // overwritten below by a dry-run transport, so `/test` can never
+          // reach it (see the note under `testIntegration`).
           transport: integrations.transport,
         };
         const input =
