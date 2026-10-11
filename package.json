@@ -9,7 +9,7 @@
   ],
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json",
-    "test": "vitest run"
+    "test": "bun test"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240909.0",
