@@ -549,9 +549,11 @@ describe("M4 e2e — no secret appears in any tool output", () => {
       const raw = await res.text();
       expect(raw).not.toContain(SECRET);
       expect(raw).not.toContain(NESTED_SECRET);
-      // The non-secret part survives, so redaction is not "drop everything".
+      // The *shape* survives (a caller sees which keys exist), but no config
+      // VALUE does: an integration config is a secret container by contract.
       if (tool === "get_integration") {
-        expect(raw).toContain("https://hooks.example/abc");
+        expect(raw).toContain("url");
+        expect(raw).not.toContain("https://hooks.example/abc");
       }
     }
   });

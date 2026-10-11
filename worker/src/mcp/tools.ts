@@ -334,6 +334,39 @@ function sortedFrom(values: readonly string[]): readonly string[] {
   return [...set].sort((a, b) => b.length - a.length);
 }
 
+/**
+ * Redact an integration record for the wire.
+ *
+ * An integration `config` is a secret container by contract: whatever a provider
+ * needs to authenticate (webhook URLs, bot tokens, API keys) lives there, and the
+ * value may carry **no inline marker** and sit under an **innocent key** (e.g.
+ * `chat_id`, `note`) when it was seeded outside the tool write-path. Structural
+ * key-matching alone would let such a value through. So the whole `config` is
+ * replaced leaf-by-leaf with {@link REDACTED} — the *shape* survives (a caller
+ * still sees which keys exist) but no value does. `redactSecrets` then runs over
+ * the whole record for defence in depth (e.g. a secret echoed into `name`).
+ */
+export function redactIntegration(record: unknown): unknown {
+  if (record === null || typeof record !== "object") return redactSecrets(record);
+  const source = record as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(source)) {
+    out[key] = key === "config" ? redactConfigDeep(value) : value;
+  }
+  return redactSecrets(out);
+}
+
+/** Replace every leaf of a config object with {@link REDACTED}, preserving shape. */
+function redactConfigDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactConfigDeep);
+  if (value === null || typeof value !== "object") return REDACTED;
+  const out: Record<string, unknown> = {};
+  for (const [key, inner] of Object.entries(value as Record<string, unknown>)) {
+    out[key] = redactConfigDeep(inner);
+  }
+  return out;
+}
+
 /** The recursive core of {@link redactSecrets}. */
 function redactWalk(value: unknown, secrets: readonly string[]): unknown {
   if (typeof value === "string") {
@@ -907,7 +940,7 @@ export function createMcpTools(deps: McpToolDeps): McpTools {
         const projectId = reqString(args, "projectId");
         await authorizeRead(principal, projectId);
         const integrations = await deps.integrations.list(projectId);
-        return { integrations };
+        return { integrations: integrations.map(redactIntegration) };
       }
       case "get_integration": {
         const projectId = reqString(args, "projectId");
@@ -915,7 +948,7 @@ export function createMcpTools(deps: McpToolDeps): McpTools {
         const integrationId = reqString(args, "integrationId");
         const integration = await deps.integrations.get(projectId, integrationId);
         if (integration === null) throw new McpToolError("not_found", `no such integration: ${integrationId}`);
-        return { integration };
+        return { integration: redactIntegration(integration) };
       }
       default:
         throw new McpToolError("unknown_tool", `unknown read tool: ${name}`);
@@ -1054,7 +1087,7 @@ export function createMcpTools(deps: McpToolDeps): McpTools {
         secrets.addDeep(config);
         const record: IntegrationRecord = { projectId, id: integrationId, config, updatedAt: now() };
         await deps.integrations.put(record);
-        return { integration: record };
+        return { integration: redactIntegration(record) };
       }
       case "emit_event": {
         const projectId = reqString(args, "projectId");

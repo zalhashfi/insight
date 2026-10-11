@@ -508,7 +508,7 @@ describe("mcp tools — secret redaction", () => {
     }
   });
 
-  it("redacts the secret-bearing config key structurally AND its plaintext by value", async () => {
+  it("redacts the whole config structurally (an integration config is a secret container)", async () => {
     const { set } = tools();
     const out = asShape<{ integration: { config: Record<string, unknown> } }>(
       await set.call("get_integration", { projectId: PROJECT, integrationId: "hooks" }, OWNER),
@@ -517,10 +517,24 @@ describe("mcp tools — secret redaction", () => {
 
     // Structural: the key `apiKey` looks secret-bearing → replaced outright.
     expect(out.integration.config.apiKey).toBe(REDACTED);
-    // Value: the same plaintext under an innocent key is rewritten.
+    // Every leaf of a config is a secret container: even an innocuous-looking
+    // `url` is redacted, and the nested plaintext under an innocent key goes too.
+    expect(out.integration.config.url).toBe(REDACTED);
     expect(nested.note).toBe(REDACTED);
-    // The non-secret parts survive, so redaction is not "drop everything".
-    expect(out.integration.config.url).toBe("https://hooks.example/abc");
+    // The *shape* survives, so a caller still sees which keys exist.
+    expect(Object.keys(out.integration.config).sort()).toEqual(["apiKey", "nested", "url"]);
+  });
+
+  it("redacts a no-marker secret seeded OUTSIDE the write path under an innocent key", async () => {
+    // The gap the prior audit probed: a value with no inline marker, under a key
+    // that is not secret-looking, seeded directly into the store (never through
+    // the tool write-path, so it is not in the SecretRegistry). Key-name and
+    // value passes alone would leak it; the config-container rule must not.
+    const { set, fake } = tools();
+    fake.addIntegration(PROJECT, "seeded", { chat_id: "-100200", note: "7731234567:AAH9xQ" });
+    const out = JSON.stringify(await set.call("get_integration", { projectId: PROJECT, integrationId: "seeded" }, OWNER));
+    expect(out).not.toContain("7731234567:AAH9xQ");
+    expect(out).not.toContain("-100200");
   });
 
   it("redacts the secret in the response of the write that stored it", async () => {
