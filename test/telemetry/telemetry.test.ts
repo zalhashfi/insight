@@ -20,10 +20,15 @@ import {
 } from "../../worker/src/domains/telemetry/telemetry";
 import {
   RATE_LIMITED_CODE,
+  RATE_LIMITED_STATUS,
   RETRY_AFTER_HEADER,
   RateLimiter,
   type RateLimitDecision,
 } from "../../worker/src/domains/telemetry/rate-limit";
+import {
+  DEVICE_STATUSES,
+  INGEST_REFUSED,
+} from "../../worker/src/domains/devices/metadata";
 import {
   readBearerToken,
   type DevicePrincipal,
@@ -565,7 +570,10 @@ describe("POST /v1/telemetry — rate limiting", () => {
     expect(h.sink.size).toBe(25);
   });
 
-  it("a throwing limiter fails closed with 429 (a broken guard never opens the gate)", async () => {
+  it("a throwing limiter fails closed with 429 rate_limited + retry-after and zero writes (a broken guard never opens the gate)", async () => {
+    // The budget cannot be enforced when the limiter store is down, so the route
+    // must refuse — never treat "limiter broke" as "admit". Same wire shape as a
+    // normal denial: a frozen `429 rate_limited` with a valid `retry-after`.
     const throwing: IngestRateLimiter = {
       checkAndConsume(): RateLimitDecision {
         throw new Error("limiter store unavailable");
@@ -573,7 +581,13 @@ describe("POST /v1/telemetry — rate limiting", () => {
     };
     const h = harness({ rateLimiter: throwing });
     const res = await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-x" });
-    expect(res.status).toBe(500);
+
+    expect(res.status).toBe(429);
+    expect(res.status).toBe(RATE_LIMITED_STATUS);
+    expect((await errorOf(res)).error).toBe(RATE_LIMITED_CODE);
+    const retryAfter = Number(res.headers.get(RETRY_AFTER_HEADER));
+    expect(Number.isInteger(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThanOrEqual(1);
     expect(h.sink.size).toBe(0);
   });
 });
@@ -609,10 +623,47 @@ describe("POST /v1/telemetry — device ingestibility (INV-DEV-status)", () => {
     expect(res.status).toBe(403);
     expect((await errorOf(res)).error).toBe(DEVICE_NOT_INGESTIBLE_CODE);
     expect(h.sink.size).toBe(0);
-    // Sanity: the policy table really does refuse these two and only these.
-    expect(INGEST_REFUSED_STATUSES).toContain("dormant");
-    expect(INGEST_REFUSED_STATUSES).toContain("retired");
-    expect(INGEST_REFUSED_STATUSES).not.toContain("active");
+  });
+
+  // The refused set has ONE home: the domain policy `INGEST_REFUSED`. The route
+  // must not carry a drifting second copy, so this proves route ≡ domain across
+  // the WHOLE status vocabulary — for every status, the route's verdict equals
+  // `INGEST_REFUSED[status]`, and a route-side flip of the policy would fail it.
+  it("the route's refused set is the domain policy INGEST_REFUSED — proven, not restated", () => {
+    const routeRefuses = (status: string): boolean => INGEST_REFUSED_STATUSES.includes(status);
+
+    // Membership is exactly the domain table's, for every known status.
+    for (const status of DEVICE_STATUSES) {
+      expect(routeRefuses(status)).toBe(INGEST_REFUSED[status]);
+    }
+
+    // Anchored to the domain contract, not a literal: retired and dormant are
+    // refused because `INGEST_REFUSED` says so, and only those.
+    expect(routeRefuses("retired")).toBe(true);
+    expect(routeRefuses("dormant")).toBe(true);
+    expect(routeRefuses("active")).toBe(false);
+    expect(INGEST_REFUSED).toEqual({ active: false, dormant: true, retired: true });
+  });
+
+  it("a DORMANT device is refused end-to-end BECAUSE the domain policy refuses it", async () => {
+    // Drive the route for every status and compare the outcome to the table, so
+    // the cross-check is behavioural, not just a membership test.
+    for (const status of DEVICE_STATUSES) {
+      const h = harness({ ingestibility: gateFor({ [`${PROJECT}/dev-${status}`]: status }) });
+      const res = await postJson(
+        h.app,
+        { metrics: { temp: 1 } },
+        { "x-insight-device": `dev-${status}` },
+      );
+      if (INGEST_REFUSED[status]) {
+        expect(res.status).toBe(DEVICE_NOT_INGESTIBLE_STATUS);
+        expect((await errorOf(res)).error).toBe(DEVICE_NOT_INGESTIBLE_CODE);
+        expect(h.sink.size).toBe(0);
+      } else {
+        expect(res.status).toBe(204);
+        expect(h.sink.size).toBe(1);
+      }
+    }
   });
 
   it("accepts an ACTIVE device with 204 and records the sample", async () => {

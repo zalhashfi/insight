@@ -31,7 +31,8 @@
  *      {@link DeviceIngestibilityGate} (the `devices` registry in production).
  *      A device KNOWN to be `dormant`/`retired` -> `403 device_not_ingestible`;
  *      an UNKNOWN device is admitted and auto-registered `active` below. This
- *      runs before validation, so a retired device's payload is never parsed.
+ *      runs after the size/shape read of the body but before the per-metric
+ *      validation rules, so a retired device's payload is never validated.
  *   2. **Server-stamped time** — every accepted record is stamped with the
  *      *server's* clock (the injected `now` seam). Any device-supplied `ts`,
  *      `time` or `timestamp` field is IGNORED for ordering, so a device with a
@@ -63,6 +64,10 @@
 
 import type { Context } from "hono";
 import { Hono } from "hono";
+// The ingest-refused policy has ONE home: `devices/metadata.ts`. This route
+// reads `INGEST_REFUSED` directly rather than keeping a parallel literal, so
+// the dormancy policy cannot drift between the two modules.
+import { INGEST_REFUSED, type DeviceStatus } from "../devices/metadata";
 import {
   requireScope,
   readBearerToken,
@@ -78,16 +83,31 @@ import {
 } from "../../shared/validation";
 import {
   rateLimitedBody,
+  RATE_LIMITED_STATUS,
+  RETRY_AFTER_HEADER,
   type RateLimitDecision,
   type RateLimitPolicy,
 } from "./rate-limit";
 
 // ---------------------------------------------------------------------------
-// Ingress-gate constants (mirror the device + contract vocabularies)
+// Ingress-gate constants (the device policy is READ, the contract codes restated)
 // ---------------------------------------------------------------------------
 
-/** Device lifecycle statuses that may NOT ingest (see `domains/devices`). */
-export const INGEST_REFUSED_STATUSES: readonly string[] = ["dormant", "retired"];
+/**
+ * Device lifecycle statuses that may NOT ingest, **derived** from the domain
+ * policy {@link INGEST_REFUSED} in `devices/metadata.ts`.
+ *
+ * This is deliberately not an independent literal: the route must not carry a
+ * second copy of the dormancy policy that can drift from the domain's. Flipping
+ * `dormant` in `INGEST_REFUSED` (and nowhere else) changes what this route
+ * refuses too, by construction. Sorted only so the exported order is stable for
+ * tests; membership is exactly `INGEST_REFUSED`'s.
+ */
+export const INGEST_REFUSED_STATUSES: readonly string[] = (
+  Object.keys(INGEST_REFUSED) as DeviceStatus[]
+)
+  .filter((status) => INGEST_REFUSED[status])
+  .sort();
 
 /** Lifecycle status assumed for a device the registry does not know yet. */
 export const DEFAULT_DEVICE_STATUS = "active";
@@ -97,6 +117,27 @@ export const DEVICE_NOT_INGESTIBLE_CODE = "device_not_ingestible" as const;
 
 /** Status carrying {@link DEVICE_NOT_INGESTIBLE_CODE} (spec §6.9). */
 export const DEVICE_NOT_INGESTIBLE_STATUS = 403 as const;
+
+/**
+ * The denial a *throwing* rate limiter produces — fail closed.
+ *
+ * A limiter that throws is an unenforceable budget, so the route refuses the
+ * request exactly as if it were over budget: the frozen `429` status, the frozen
+ * `rate_limited` body, and a `retry-after` of one second (the minimum valid
+ * value) so the client backs off rather than hot-loops. This is deliberately the
+ * SAME wire shape as a normal denial — a caller cannot distinguish "over budget"
+ * from "limiter broken", which is the point: a broken guard must not be a bypass
+ * and must not leak its failure mode.
+ */
+const FAIL_CLOSED_RETRY_AFTER_SECONDS = "1" as const;
+
+/** Frozen `429` used when the limiter itself throws (fail closed). */
+export const DENIED_STATUS = RATE_LIMITED_STATUS;
+
+/** Headers attached to the fail-closed `429`. */
+const FAIL_CLOSED_HEADERS: Readonly<Record<string, string>> = {
+  [RETRY_AFTER_HEADER]: FAIL_CLOSED_RETRY_AFTER_SECONDS,
+};
 
 /** Body of the `403` a non-ingestible device receives. */
 export interface DeviceNotIngestibleBody {
@@ -452,10 +493,25 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
     //     limiter's own `retry-after` header and a frozen `rate_limited` body,
     //     and — crucially — the route returns BEFORE reading the body, so a
     //     throttled request does no work and writes nothing to the sink.
+    //
+    //     FAIL CLOSED: a limiter that *throws* (store unavailable, clock skew,
+    //     a bug) is an unenforceable budget, so it is treated as a denial — the
+    //     same `429 rate_limited` — NEVER as a bypass. The catch sits in the one
+    //     module that can guarantee "zero sink writes on a broken guard", which
+    //     it does by returning before the body is read; a thrown error escaping
+    //     to `onError` would instead produce a bare `500` with no
+    //     `retry-after` and no frozen body.
     if (deps.rateLimiter !== undefined) {
-      const decision = deps.rateLimiter.checkAndConsume(token, rateLimit.limit, rateLimit.windowMs);
-      if (!decision.allowed) {
-        return c.json(rateLimitedBody(), decision.status, decision.headers);
+      let decision: RateLimitDecision | undefined;
+      try {
+        decision = deps.rateLimiter.checkAndConsume(token, rateLimit.limit, rateLimit.windowMs);
+      } catch {
+        // A broken guard never opens the gate: refuse as if over budget.
+        decision = undefined;
+      }
+      if (decision === undefined || !decision.allowed) {
+        const headers = decision?.headers ?? FAIL_CLOSED_HEADERS;
+        return c.json(rateLimitedBody(), DENIED_STATUS, headers);
       }
     }
 
@@ -463,6 +519,9 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
     //    `{ metric, value }` shorthand beside the canonical `{ metrics: [...] }`
     //    shape. Only a *shape* rewrite happens here; every size / key / value /
     //    count / JSON rule is applied by the shared module in step 3.
+    //
+    //    The rate limiter (step 1c) has already run and returned, so a throttled
+    //    request never reaches this line: the guard precedes the body read.
     const raw = await c.req.text();
 
     // 2a. SIZE — the shared module's own size gate, run first and on the raw
@@ -482,16 +541,22 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
       normalised = raw;
     }
 
-    // 3. DEVICE INGESTIBILITY (INV-DEV-status) — the lifecycle gate runs BEFORE
-    //    validation, so a retired/dormant device is refused without its payload
-    //    ever being parsed or measured (and, as with the limiter, with zero sink
-    //    writes). The device key is resolved here — from the same header step 5
-    //    reads — so the gate and the sink attribute to the identical key.
+    // 3. DEVICE INGESTIBILITY (INV-DEV-status) — codes the body has already been
+    //    READ and size-checked above (steps 2/2a/2b), but the lifecycle gate runs
+    //    BEFORE the per-metric validation rules below, so a retired/dormant
+    //    device is refused without its payload ever being *validated* (and, as
+    //    with the limiter, with zero sink writes). The device key is resolved
+    //    here — from the same header step 6 reads — so the gate and the sink
+    //    attribute to the identical key.
     //
     //    An UNKNOWN device (no status record yet) is admitted and will be
-    //    auto-registered `active` at step 5; only a device KNOWN to be
+    //    auto-registered `active` at step 6; only a device KNOWN to be
     //    `dormant`/`retired` is refused `403 device_not_ingestible`. With no
     //    `ingestibility` seam injected, every device is treated as ingestible.
+    //
+    //    The refused set is READ from the domain policy `INGEST_REFUSED`
+    //    (`devices/metadata.ts`, via {@link INGEST_REFUSED_STATUSES}); this route
+    //    owns no copy of it, so the dormancy policy cannot drift.
     const device = normaliseDevice(c.req.header(DEVICE_HEADER), defaultDevice);
     const projectId = principal.projectId;
     if (deps.ingestibility !== undefined) {
