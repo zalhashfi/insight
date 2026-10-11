@@ -92,6 +92,31 @@ describe("crypto: encrypt→decrypt round-trips", () => {
     await expect(decryptSecret(first, key)).resolves.toBe(PASSWORD);
     await expect(decryptSecret(second, key)).resolves.toBe(PASSWORD);
   });
+
+  it("falls back to the CSPRNG when a nonce source returns null or undefined", async () => {
+    // The documented seam contract: `null` means "I have no nonce", so the draw
+    // falls through to the platform CSPRNG. A zero nonce would be *reuse* under
+    // one key — catastrophic for GCM — so the fallback must still be distinct.
+    const { key } = await generateSecretKey();
+    const zeroNonce = bytesToBase64url(new Uint8Array(SECRET_NONCE_BYTES));
+
+    for (const source of [() => null, () => undefined] as const) {
+      const first = await encryptSecret(PASSWORD, key, { nonce: source as never });
+      const second = await encryptSecret(PASSWORD, key, { nonce: source as never });
+      const firstNonce = first.split(":")[2].split(".")[0];
+      const secondNonce = second.split(":")[2].split(".")[0];
+
+      // Distinct envelopes, and neither nonce is the all-zero one.
+      expect(first).not.toBe(second);
+      expect(firstNonce).not.toBe(zeroNonce);
+      expect(secondNonce).not.toBe(zeroNonce);
+      expect(base64urlToBytes(firstNonce)?.length).toBe(SECRET_NONCE_BYTES);
+
+      // …and each still opens to the exact plaintext.
+      await expect(decryptSecret(first, key)).resolves.toBe(PASSWORD);
+      await expect(decryptSecret(second, key)).resolves.toBe(PASSWORD);
+    }
+  });
 });
 
 describe("crypto: stored ciphertext does NOT contain the plaintext", () => {

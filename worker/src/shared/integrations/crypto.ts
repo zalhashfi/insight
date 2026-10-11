@@ -343,8 +343,13 @@ export async function encryptSecret(
   options: EncryptSecretOptions = {},
 ): Promise<string> {
   // A fresh CSPRNG nonce per call; reusing one under AES-GCM is catastrophic.
+  // The seam's contract is that a `null`/`undefined` return means "I have no
+  // nonce" and falls through to the CSPRNG — not that it supplies a zero nonce,
+  // which would repeat under a fixed key and destroy GCM's security.
   const nonce = options.nonce?.() ?? new Uint8Array(SECRET_NONCE_BYTES);
-  if (options.nonce === undefined) crypto.getRandomValues(nonce);
+  if (options.nonce === undefined || nonce.every((byte) => byte === 0)) {
+    crypto.getRandomValues(nonce);
+  }
   if (nonce.length !== SECRET_NONCE_BYTES) {
     throw new SecretCryptoError(
       "malformed_nonce",
