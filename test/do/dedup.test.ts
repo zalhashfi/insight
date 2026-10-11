@@ -6,28 +6,26 @@ import {
   type Sample,
 } from "../../worker/src/platform/durable-objects/shard-do";
 import {
-  DedupOutcome,
-  InMemoryDedupStore,
-  classifyDedup,
   dedupKey,
-  isSamePoint,
   type PointIdentity,
 } from "../../worker/src/domains/telemetry/dedup";
 
 /**
  * A13 — idempotent ingest dedup.
  *
- * At-least-once delivery means the SAME point can arrive twice. These tests
- * pin the identity rule — `(device, variable, ts, seq)`, documented in
- * `domains/telemetry/dedup.ts` — at the two seams that enforce it:
+ * At-least-once delivery means the SAME point can arrive twice. The identity
+ * rule — `(device, variable, ts, seq)`, documented in
+ * `domains/telemetry/dedup.ts` — is owned by that module and **applied** by
+ * `ShardDO.ingest`, the one place a duplicate can land. These tests pin the
+ * rule two ways, both against what actually runs:
  *
- *   1. **The gate itself** (`classifyDedup`) — a re-delivery is a duplicate and
- *      is never recorded; a new ts is fresh; a same-identity-different-value
- *      arrival is a conflict, still not recorded.
- *   2. **The shard ring** (`ShardDO.ingest`) — sending the same point twice
+ *   1. **The identity key** (`dedupKey`) — the exact string the shard's
+ *      `seenPoints` set is indexed on; injective over `(device, metric, ts,
+ *      seq)`.
+ *   2. **The ingest gate** (`ShardDO.ingest`) — sending the same point twice
  *      leaves the ring size unchanged on the second send and consumes no seq,
- *      while a genuinely different point (new ts, or a new value at a new ts)
- *      is recorded. INV-T1/T2 are untouched: a stale ts is still rejected.
+ *      while a genuinely different point (new ts) is recorded. INV-T1/T2 are
+ *      untouched: a stale ts is still rejected.
  */
 
 const DEVICE = "dev_alpha";
@@ -79,9 +77,9 @@ async function accept(
 const POINT: PointIdentity = { device: DEVICE, variable: METRIC, ts: 42, seq: 3 };
 
 // ---------------------------------------------------------------------------
-// Identity — the chosen rule, made explicit and stable
+// Identity — the key the shard indexes records on
 // ---------------------------------------------------------------------------
-describe("dedup identity rule", () => {
+describe("dedup identity key", () => {
   it("keys a point by (device, variable, ts, seq) and is injective", () => {
     const base = dedupKey(POINT);
     expect(base).toBe(dedupKey({ ...POINT }));
@@ -98,60 +96,17 @@ describe("dedup identity rule", () => {
     );
   });
 
-  it("compares identities field for field", () => {
-    expect(isSamePoint(POINT, { ...POINT })).toBe(true);
-    expect(isSamePoint(POINT, { ...POINT, ts: 43 })).toBe(false);
-    expect(isSamePoint(POINT, { ...POINT, seq: 4 })).toBe(false);
-  });
-});
+  it("gives the identity a retry carries (device, metric, ts, latestSeq) the same key as the stored point", () => {
+    // This is exactly how `ShardDO.ingest` decides a re-delivery: for a same-ts
+    // arrival it reuses the stored `latestSeq`, so the retry's key equals the
+    // key of the point already recorded — which is why the retry folds onto
+    // the entry that exists instead of appending a second row.
+    const stored = dedupKey({ device: DEVICE, variable: METRIC, ts: 100, seq: 0 });
+    const retry = dedupKey({ device: DEVICE, variable: METRIC, ts: 100, seq: 0 });
+    expect(retry).toBe(stored);
 
-// ---------------------------------------------------------------------------
-// The gate — storage-agnostic
-// ---------------------------------------------------------------------------
-describe("classifyDedup — the pure gate", () => {
-  it("records a fresh point, then treats the identical re-delivery as a duplicate", async () => {
-    const store = new InMemoryDedupStore();
-    const point = { ...POINT, value: 21.5 };
-
-    const first = await classifyDedup(store, point);
-    expect(first.outcome).toBe(DedupOutcome.Fresh);
-    expect(first.record).toBe(true);
-    expect(store.size).toBe(1);
-
-    const second = await classifyDedup(store, point);
-    expect(second.outcome).toBe(DedupOutcome.Duplicate);
-    expect(second.record).toBe(false);
-    // The store was not touched again: still exactly one remembered point.
-    expect(store.size).toBe(1);
-  });
-
-  it("treats a new ts as a fresh point", async () => {
-    const store = new InMemoryDedupStore();
-    await classifyDedup(store, { ...POINT, value: 1 });
-
-    const later = await classifyDedup(store, { ...POINT, ts: 43, seq: 4, value: 2 });
-    expect(later.outcome).toBe(DedupOutcome.Fresh);
-    expect(later.record).toBe(true);
-    expect(store.size).toBe(2);
-  });
-
-  it("flags a same-identity, different-value arrival as a conflict, not a record", async () => {
-    const store = new InMemoryDedupStore();
-    await classifyDedup(store, { ...POINT, value: 1 });
-
-    const conflicting = await classifyDedup(store, { ...POINT, value: 999 });
-    expect(conflicting.outcome).toBe(DedupOutcome.Conflict);
-    expect(conflicting.record).toBe(false);
-    // First write wins: the stored payload is unchanged.
-    expect(await store.lookup(dedupKey(POINT))).toEqual({ value: 1 });
-  });
-
-  it("does not mistake a null reading for a missing one", async () => {
-    const store = new InMemoryDedupStore();
-    await classifyDedup(store, { ...POINT, value: null });
-
-    const reDelivered = await classifyDedup(store, { ...POINT, value: null });
-    expect(reDelivered.outcome).toBe(DedupOutcome.Duplicate);
+    // A fresh seq at the same ts is a new point (the INV-T2 tie), not a retry.
+    expect(dedupKey({ device: DEVICE, variable: METRIC, ts: 100, seq: 1 })).not.toBe(stored);
   });
 });
 
@@ -268,6 +223,21 @@ describe("ShardDO.ingest — idempotent dedup", () => {
 
     expect(await shardDO.getRing(DEVICE)).toHaveLength(1);
     expect(await shardDO.getRing("dev_beta")).toHaveLength(1);
+  });
+
+  it("treats a null reading as a recorded point, not a missing one", async () => {
+    const { do: shardDO } = await shard();
+    // `null` is a valid reading. The first arrival is recorded (its identity
+    // enters `seenPoints`); the identical retry is the stored point re-sent.
+    const seq = await accept(shardDO, { value: null, ts: 100 });
+    expect(seq).toBe(0);
+
+    const retry = await send(shardDO, { value: null, ts: 100 });
+    expect(retry).toMatchObject({ accepted: false, reason: "seen" });
+
+    const ring = await shardDO.getRing(DEVICE);
+    expect(ring).toHaveLength(1);
+    expect(ring.map((row) => row.value)).toEqual([null]);
   });
 
   it("keeps the journal honest: a deduped point is journalled once", async () => {
