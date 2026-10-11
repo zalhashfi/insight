@@ -157,12 +157,46 @@ export async function createProjectToken(
 }
 
 /**
+ * INV-A3, made explicit: device-token verification is **uncached**.
+ *
+ * Device tokens are the one credential where immediacy is security-relevant —
+ * an operator revoking a leaked machine token expects the very next request to
+ * fail, not "within a minute". There is therefore no memo, module-level map or
+ * TTL cache anywhere between {@link verifyProjectToken} and the store: every
+ * verification does a fresh `findByHash`. This constant is the machine-readable
+ * statement of that contract; the tests assert it rather than trusting prose.
+ *
+ * (Contrast: a *user-session* cache with a small TTL — ≤60s — is acceptable
+ * because a session token lives in a browser tab and revocation latency is
+ * bound by an interactive human. A device token has no such cover: it is an
+ * unattended credential, so a stale positive is a live vulnerability.)
+ */
+export const DEVICE_TOKEN_VERIFY_IS_UNCACHED = true as const;
+
+/**
+ * The single, uncached read step behind {@link verifyProjectToken}: hash the
+ * plaintext and fetch the row it indexes, on EVERY call.
+ *
+ * Exported so a caller (or test) can invoke the raw lookup directly and prove
+ * that `findByHash` is hit per call — there is no layer here to short-circuit a
+ * second, third or Nth presentation of the same plaintext.
+ */
+async function readTokenByPlaintext(
+  repo: TokenRepo,
+  plaintext: string,
+): Promise<ProjectToken | null> {
+  const hash = await hashToken(plaintext);
+  return repo.findByHash(hash);
+}
+
+/**
  * Verify a presented plaintext token.
  *
  * Hashes the input and looks it up. Returns the record iff it exists AND has
  * not been revoked (and, when it carries an expiry, has not expired). The lookup
- * is performed on EVERY call — there is no negative or positive cache — so a
- * token revoked a moment ago fails immediately rather than riding out a TTL.
+ * is performed on EVERY call — there is no negative or positive cache (see
+ * {@link DEVICE_TOKEN_VERIFY_IS_UNCACHED}) — so a token revoked a moment ago
+ * fails immediately rather than riding out a TTL.
  *
  * `undefined` (rather than `null`) marks "no usable token"; the reason is
  * intentionally not distinguished to avoid an oracle.
@@ -172,8 +206,8 @@ export async function verifyProjectToken(
   plaintext: string,
   now: Clock = defaultClock,
 ): Promise<ProjectToken | undefined> {
-  const hash = await hashToken(plaintext);
-  const record = await repo.findByHash(hash);
+  // Fresh, uncached read on every call — the whole point of INV-A3.
+  const record = await readTokenByPlaintext(repo, plaintext);
   if (record === null) return undefined;
   if (record.revokedAt !== null) return undefined;
   if (record.expiresAt !== null && record.expiresAt !== undefined) {
