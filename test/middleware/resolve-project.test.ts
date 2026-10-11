@@ -40,7 +40,17 @@ type RouteHandler = (c: Context<{ Variables: AppVars }>) => Response;
 const PROJECT_A = "prj_alpha";
 const PROJECT_B = "prj_beta";
 
+/**
+ * The fixture tokens, one per scope shape the middleware must distinguish:
+ *
+ *   * {@link TOKEN_A} — explicitly `read write` (the operational M1 token);
+ *   * {@link TOKEN_A_SCOPELESS} — NO scope string: read-only under the
+ *     least-privilege default, so it may read but never write;
+ *   * {@link TOKEN_A_READONLY} — explicitly `read`; cannot write;
+ *   * {@link TOKEN_A_WRITEONLY} — explicitly `write`; cannot even read.
+ */
 const DEVICE_TOKEN_A = "pt_device_a_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+const DEVICE_TOKEN_A_SCOPELESS = "pt_device_a_scopeless_ddddddddddddddddddd";
 const DEVICE_TOKEN_A_READONLY = "pt_device_a_readonly_bbbbbbbbbbbbbbbbbbbbbb";
 const DEVICE_TOKEN_A_WRITEONLY = "pt_device_a_writeonly_ccccccccccccccccccc";
 const DEVICE_TOKEN_B = "pt_device_b_dddddddddddddddddddddddddddddd";
@@ -65,8 +75,20 @@ const BOB: UserPrincipal = {
   permissions: ["project:read", "project:update", "member:invite"],
 };
 
-/** A project token for A with full (unspecified) scopes. */
-const TOKEN_A: DevicePrincipal = { kind: "device", projectId: PROJECT_A, tokenId: "tok_a" };
+/** A project token for A carrying full `read write` capabilities. */
+const TOKEN_A: DevicePrincipal = {
+  kind: "device",
+  projectId: PROJECT_A,
+  tokenId: "tok_a",
+  scopes: "read write",
+};
+
+/** Same project, NO scope string — least-privilege default: read only. */
+const TOKEN_A_SCOPELESS: DevicePrincipal = {
+  kind: "device",
+  projectId: PROJECT_A,
+  tokenId: "tok_a_none",
+};
 
 /** Same project, but scoped to reads only. */
 const TOKEN_A_READONLY: DevicePrincipal = {
@@ -86,6 +108,7 @@ const TOKEN_A_WRITEONLY: DevicePrincipal = {
 
 const DEVICE_TOKENS: Record<string, CredentialLookupResult> = {
   [DEVICE_TOKEN_A]: TOKEN_A,
+  [DEVICE_TOKEN_A_SCOPELESS]: TOKEN_A_SCOPELESS,
   [DEVICE_TOKEN_A_READONLY]: TOKEN_A_READONLY,
   [DEVICE_TOKEN_A_WRITEONLY]: TOKEN_A_WRITEONLY,
   [DEVICE_TOKEN_B]: { kind: "device", projectId: PROJECT_B, tokenId: "tok_b" },
@@ -223,6 +246,17 @@ describe("scope gate — a read-only credential cannot write", () => {
     const res = await makeApp().request("/device/ingest", {
       method: "POST",
       headers: bearer(DEVICE_TOKEN_A_READONLY),
+    });
+    expect(res.status).toBe(403);
+    expect(await errorCode(res)).toBe("insufficient_scope");
+  });
+
+  it("a scope-less device token attempting device ingress (a write) -> 403", async () => {
+    // The least-privilege default: no scope string means read-only, so this
+    // credential authenticates but is refused the write.
+    const res = await makeApp().request("/device/ingest", {
+      method: "POST",
+      headers: bearer(DEVICE_TOKEN_A_SCOPELESS),
     });
     expect(res.status).toBe(403);
     expect(await errorCode(res)).toBe("insufficient_scope");
@@ -389,13 +423,18 @@ describe("parseScopes / hasScope", () => {
     expect([...parseScopes("")].length).toBe(0);
   });
 
-  it("device scopes: absent/read are read-ok; only explicit read may read", () => {
+  it("device scopes: absent means read-only; explicit scope is honoured", () => {
+    // Explicit full scope: both capabilities.
     expect(hasScope(TOKEN_A, "read")).toBe(true);
-    expect(hasScope(TOKEN_A, "write")).toBe(true); // no scope string -> not restricted
+    expect(hasScope(TOKEN_A, "write")).toBe(true);
+    // Absent scope string -> LEAST PRIVILEGE: read yes, write no.
+    expect(hasScope(TOKEN_A_SCOPELESS, "read")).toBe(true);
+    expect(hasScope(TOKEN_A_SCOPELESS, "write")).toBe(false);
+    // Explicit read-only cannot write; explicit write-only cannot read.
     expect(hasScope(TOKEN_A_READONLY, "read")).toBe(true);
-    expect(hasScope(TOKEN_A_READONLY, "write")).toBe(false); // read-only cannot write
-    expect(hasScope(TOKEN_A_WRITEONLY, "write")).toBe(true); // explicit write
-    expect(hasScope(TOKEN_A_WRITEONLY, "read")).toBe(false); // and nothing else
+    expect(hasScope(TOKEN_A_READONLY, "write")).toBe(false);
+    expect(hasScope(TOKEN_A_WRITEONLY, "write")).toBe(true);
+    expect(hasScope(TOKEN_A_WRITEONLY, "read")).toBe(false);
   });
 
   it("user membership maps roles onto the shared permission table", () => {

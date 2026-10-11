@@ -23,6 +23,23 @@
  * never observe project B's state or series — the mismatch is rejected, not
  * filtered, so there is no window in which B's data is loaded at all.
  *
+ * ## Strict credential parsing + read-capability gate
+ *
+ * The credential is parsed by the SHARED strict Bearer parser
+ * ({@link readBearerToken} from `resolve-project.ts`), the same one the ingest
+ * route uses: a bare or scheme-less header (`Authorization: pt_…` without
+ * `Bearer`) is not a credential at all and is refused `401`, never silently
+ * accepted. The resolved principal is additionally gated with the SHARED
+ * `requireScope(c, "read")`, so a credential that authenticates but genuinely
+ * lacks `read` (e.g. a `write`-only or otherwise unprivileged credential) is
+ * refused `403` — one parser and one policy module across every route.
+ *
+ * The route-side `resolveCredentials` seam returns only a tenant id; the
+ * principal it is turned into for the gate therefore carries **no explicit
+ * `scopes`**, which the least-privilege default treats as `read`. That is the
+ * *deliberate* read policy: this surface will only ever consume verifiers that
+ * resolve a read-capable credential, and it can express no `write`.
+ *
  * ## The seams
  *
  * Nothing here touches a Durable Object, D1 or a real binding. Three lookups are
@@ -47,6 +64,11 @@
 
 import type { Context } from "hono";
 import { Hono } from "hono";
+import {
+  readBearerToken,
+  requireScope,
+  type Principal,
+} from "../../platform/middleware/resolve-project";
 import type { StateRow } from "../../platform/durable-objects/project-do";
 import { shardIndex, type Sample } from "../../platform/durable-objects/shard-do";
 
@@ -61,6 +83,11 @@ import { shardIndex, type Sample } from "../../platform/durable-objects/shard-do
  * pass a stub. Returning `null` (or throwing) means "not usable" and the route
  * answers `401`. As in the ingest route, the two are deliberately
  * indistinguishable so a caller cannot probe *why* a token failed.
+ *
+ * The seam returns only the tenant. The read-capability gate is applied by the
+ * route through the shared `requireScope(c, "read")`; the principal it gates is
+ * built from this tenant with no explicit scopes, which the least-privilege
+ * default reads as `read` (see the module docblock's read policy).
  */
 export type CredentialResolver = (token: string) => Promise<{ projectId: string } | null>;
 
@@ -164,6 +191,7 @@ export interface QueryErrorBody {
 export type QueryErrorCode =
   | "unauthorized"
   | "project_mismatch"
+  | "insufficient_scope"
   | "invalid_window";
 
 // ---------------------------------------------------------------------------
@@ -171,18 +199,30 @@ export type QueryErrorCode =
 // ---------------------------------------------------------------------------
 
 /**
- * Extract the bearer credential from the `Authorization` header.
+ * Minimal `Context` view exposing only the `Authorization` header.
  *
- * Accepts `Bearer <token>` case-insensitively and a bare token (so a simple
- * `curl -H` probe works). A missing header, or a `Bearer` with nothing behind
- * it, yields `""`, which no resolver accepts.
+ * {@link readBearerToken} needs just `c.req.header("Authorization")`; this
+ * adapter lets the pure `readBearer(header)` helper reuse that ONE parser
+ * without a Hono request, so the read surface never carries a second Bearer
+ * grammar that could drift from the middleware's.
+ */
+function bearerContext(header: string): Context {
+  return { req: { header: () => header } } as unknown as Context;
+}
+
+/**
+ * Extract the bearer credential from an `Authorization` header value.
+ *
+ * Delegates to the SHARED strict parser ({@link readBearerToken}) — the same
+ * one the ingest route uses — so the read and write surfaces agree byte-for-byte
+ * on what a credential is: only `Bearer <token>` yields a value, and a bare or
+ * scheme-less header is NOT a credential.
+ *
+ * @returns the token, or `""` when the header is absent or malformed (a value
+ *   no resolver accepts, so the route answers `401`).
  */
 export function readBearer(header: string | undefined): string {
-  const raw = (header ?? "").trim();
-  if (raw === "") return "";
-  const scheme = /^Bearer\s*(.*)$/i.exec(raw);
-  if (scheme !== null) return scheme[1].trim();
-  return raw;
+  return header === undefined ? "" : (readBearerToken(bearerContext(header)) ?? "");
 }
 
 /** Parse `window` from a query string; `null` when absent or blank. */
@@ -212,6 +252,22 @@ function projectMismatch(c: Context): Response {
   return c.json(body, 403);
 }
 
+/**
+ * JSON `403` body for an authenticated credential that lacks the `read`
+ * capability this surface requires.
+ *
+ * The shape mirrors the shared `requireScope` denial (`insufficient_scope`) so
+ * the read surface speaks the same authorization vocabulary as every other
+ * route; only the transport is local.
+ */
+function insufficientScope(c: Context): Response {
+  const body: QueryErrorBody = {
+    error: "insufficient_scope",
+    message: 'this credential lacks the "read" capability required here',
+  };
+  return c.json(body, 403);
+}
+
 /** JSON `400` body for a malformed or out-of-range window. */
 function invalidWindow(c: Context, message: string): Response {
   const body: QueryErrorBody = { error: "invalid_window", message };
@@ -227,8 +283,19 @@ function byTimeThenSeq(a: SeriesPoint, b: SeriesPoint): number {
  * Is `proj` readable with this credential?
  *
  * Returns the resolved project id on success, or the exact refusal `Response`
- * to return otherwise. A `:proj` claim that disagrees with the credential is a
- * `403` (authenticated, unauthorized); anything unresolvable is a `401`.
+ * to return otherwise. The order is deliberate and mirrors the ingest route:
+ *
+ *   1. **parse** with the shared strict `readBearerToken` — a bare or
+ *      scheme-less Authorization is not a credential, so it is `401` and is
+ *      never handed to the resolver;
+ *   2. **resolve** through the injected seam (a throw is a refusal, not a 500);
+ *   3. **authorize** with the shared `requireScope(c, "read")` — a credential
+ *      that resolves but lacks `read` is `403 insufficient_scope`;
+ *   4. **match** the `:proj` claim against the credential — a disagreeing claim
+ *      is `403 project_mismatch` (authenticated, wrong tenant).
+ *
+ * A claim that disagrees with the credential is a `403`; anything unresolvable
+ * is a `401`.
  */
 async function authorise(
   c: Context,
@@ -245,6 +312,13 @@ async function authorise(
     resolved = null;
   }
   if (resolved === null) return unauthorized(c);
+
+  // READ-CAPABILITY GATE — the shared policy module, not a local check. The
+  // principal is the resolved tenant with no explicit scopes, which the
+  // least-privilege default treats as `read` (see the module docblock).
+  const principal: Principal = { kind: "device", projectId: resolved.projectId };
+  c.set("principal", principal);
+  if (requireScope(c, "read") !== null) return insufficientScope(c);
 
   const claimed = c.req.param("proj");
   if (claimed !== undefined && claimed !== resolved.projectId) {

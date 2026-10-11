@@ -92,8 +92,10 @@ export interface DevicePrincipal {
   /** Token id, when the credential resolves to a stored record. */
   readonly tokenId?: string;
   /**
-   * Space/comma separated capability list (`"read write"`). Absent means "not
-   * restricted": the credential is treated as holding every capability.
+   * Space/comma separated capability list (`"read write"`). Absent means
+   * "read only": a credential minted without an explicit scope list holds the
+   * least privilege that still lets it act — `read` — and never `write`.
+   * `write` (and anything else) must be granted explicitly.
    */
   readonly scopes?: string;
 }
@@ -189,8 +191,9 @@ export function readBearerToken(c: Context): string | null {
  * Parse a `scopes` column value into a set of tokens.
  *
  * The schema stores scopes as free text; this accepts the conventional
- * space/comma separated form (`"read write"` or `"read,write"`). `undefined`
- * (no scopes column) is treated by {@link hasScope} as "not restricted".
+ * space/comma separated form (`"read write"` or `"read,write"`). An
+ * `undefined` scope string (no scopes column) is treated by {@link hasScope}
+ * as READ-ONLY — the least-privilege default — never as unrestricted.
  */
 export function parseScopes(scopes: string | undefined | null): ReadonlySet<string> {
   if (!scopes) return new Set();
@@ -204,7 +207,8 @@ export function parseScopes(scopes: string | undefined | null): ReadonlySet<stri
  *   * a **device** is authorized by its `scopes`: a space/comma separated
  *     capability list where `read` and `write` are independent (a token scoped
  *     `"read"` may read but not write, and vice versa). An absent scope string
- *     means "not restricted" and is treated as holding every capability;
+ *     means "read only" — the least-privilege default — so a scope-less token
+ *     can never write; `write` must always be granted explicitly;
  *   * a **user** is authorized by membership — `permissions` when supplied,
  *     otherwise a real `role` checked through the membership permission table;
  *     an unstubbed user with neither is granted only a `read`-class action.
@@ -215,7 +219,11 @@ export function hasScope(
 ): boolean {
   if (principal.kind === "device") {
     const requiredClass = required === "read" ? "read" : "write";
-    if (principal.scopes === undefined) return true;
+    // Least-privilege default: an ABSENT scope string no longer means
+    // "unrestricted". A token minted without an explicit scope now holds
+    // `read` ONLY, so a scope-less credential can never write. Write (and every
+    // other capability) must be granted explicitly in the `scopes` value.
+    if (principal.scopes === undefined) return requiredClass === "read";
     return parseScopes(principal.scopes).has(requiredClass);
   }
 
@@ -247,7 +255,8 @@ function deny(
  * tenant; a handler that additionally needs a capability calls this to enforce
  * it. `read`-class actions are covered by the role/permissions the credential
  * carries; `write`-class actions require an explicit write capability, so a
- * `read`-scoped device token or a `member`-role session is refused `403`.
+ * `read`-scoped — or scope-less — device token, or a `member`-role session, is
+ * refused `403`.
  */
 export function requireScope(c: Context, required: "read" | "write"): Response | null {
   const principal = c.get("principal") as Principal | undefined;

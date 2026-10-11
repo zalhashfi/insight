@@ -421,20 +421,80 @@ describe("tenant isolation (INV-A1)", () => {
 });
 
 // ---------------------------------------------------------------------------
+// Strict credential parsing + the deliberate read policy (INV-A5 companion)
+// ---------------------------------------------------------------------------
+
+describe("read surface credential parsing (shared STRICT Bearer parser)", () => {
+  /** Send a GET with a raw Authorization header value (no helper wrapping). */
+  function rawGet(app: Hono, path: string, authorization: string): Promise<Response> {
+    return Promise.resolve(app.request(path, { headers: { authorization } }));
+  }
+
+  it("rejects a bare / scheme-less Authorization with 401 (never resolves it)", async () => {
+    const h = harness();
+    const res = await rawGet(h.app, `/v1/projects/${PROJECT_A}/state`, TOKEN_A);
+    expect(res.status).toBe(401);
+    expect(await errorCode(res)).toBe("unauthorized");
+  });
+
+  it("rejects a non-Bearer scheme (Basic) with 401", async () => {
+    const h = harness();
+    const res = await rawGet(h.app, `/v1/projects/${PROJECT_A}/state`, `Basic ${TOKEN_A}`);
+    expect(res.status).toBe(401);
+    expect(await errorCode(res)).toBe("unauthorized");
+  });
+
+  it("accepts the Bearer scheme case-insensitively (control)", async () => {
+    const h = harness();
+    h.projects.push(PROJECT_A, stateRow("dev-1", "temp", 25.4, NOW - 1000, 7));
+    const res = await rawGet(h.app, `/v1/projects/${PROJECT_A}/state`, `bearer ${TOKEN_A}`);
+    expect(res.status).toBe(200);
+  });
+
+  it("enforces the deliberate READ policy: the gate resolves a read-capable principal", async () => {
+    // The route gates the resolved tenant through the SHARED
+    // `requireScope(c, "read")`. The principal carries no explicit scopes, which
+    // the least-privilege default treats as `read` — so a plain read is granted.
+    // The policy is asserted by observing that the read succeeds on a tenant the
+    // resolver vouched for, and the gate never grants more than `read`.
+    const h = harness();
+    h.projects.push(PROJECT_A, stateRow("dev-1", "temp", 25.4, NOW - 1000, 7));
+
+    const res = await get(h.app, `/v1/projects/${PROJECT_A}/state`, TOKEN_A);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { state: StateRow[] };
+    expect(body.state).toEqual([stateRow("dev-1", "temp", 25.4, NOW - 1000, 7)]);
+  });
+
+  it("exports the shared strict parser under the read surface's name", () => {
+    // A guard: the read surface must delegate to the ONE shared parser, so a
+    // bare token is empty here exactly as it is rejected there.
+    expect(readBearer("Bearer pt_ok")).toBe("pt_ok");
+    expect(readBearer("pt_bare")).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
 
 describe("readBearer", () => {
-  it("accepts the Bearer scheme case-insensitively and a bare token", () => {
+  it("accepts the Bearer scheme case-insensitively", () => {
     expect(readBearer("Bearer pt_abc")).toBe("pt_abc");
     expect(readBearer("bearer   pt_abc")).toBe("pt_abc");
-    expect(readBearer("pt_abc")).toBe("pt_abc");
+    expect(readBearer("BEARER pt_abc")).toBe("pt_abc");
+  });
+
+  it("rejects a bare / scheme-less token (the STRICT shared parser)", () => {
+    // A bare token is NOT a credential: the read surface must not accept it.
+    expect(readBearer("pt_abc")).toBe("");
   });
 
   it("yields '' for a missing header or a Bearer with no token", () => {
     expect(readBearer(undefined)).toBe("");
     expect(readBearer("")).toBe("");
     expect(readBearer("Bearer ")).toBe("");
+    expect(readBearer("Basic pt_abc")).toBe("");
   });
 });
 

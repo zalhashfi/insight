@@ -73,7 +73,7 @@ function liveTelemetry(): LiveTelemetry {
   const devices = new InMemoryDeviceRegistry();
   const deps: TelemetryDeps = {
     verifyToken: async (token) =>
-      token === TOKEN ? { kind: "device", projectId: PROJECT } : null,
+      token === TOKEN ? { kind: "device", projectId: PROJECT, scopes: "read write" } : null,
     sink,
     devices,
     now: () => 1_700_000_000_000,

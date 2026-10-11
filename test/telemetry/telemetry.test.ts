@@ -28,8 +28,9 @@ import { DEFAULT_LIMITS, validateTelemetry } from "../../worker/src/shared/valid
  *      a credential (`401`); a rejected token is `401`; a valid `write`-scoped
  *      token resolves the project the samples are attributed to.
  *   1b. **Authz** — ingest is a write surface gated by the SHARED
- *      `requireScope(c, "write")`, so a `read`-scoped device token that
- *      authenticates is refused `403`.
+ *      `requireScope(c, "write")`, so a `read`-scoped device token — or one
+ *      whose scope is absent, which is now READ-ONLY under the least-privilege
+ *      default — that authenticates is refused `403`.
  *   2. **Server clock** — the timestamp handed to the sink is the injected
  *      `now()`, never anything a device could put in the body.
  *   3. **Device key** — `x-insight-device` names the sender; absent/blank falls
@@ -44,11 +45,18 @@ const PROJECT = "proj_alpha";
 const TOKEN = "pt_valid_token";
 
 /**
- * A well-formed device principal for {@link PROJECT}. `scopes` is left absent
- * ("not restricted") so the baseline token holds every capability — the same
- * shape production's `verifyProjectToken` returns for an unrestricted token.
+ * A well-formed device principal for {@link PROJECT}, carrying the `read write`
+ * capabilities the operational M1 token is minted with. Under the
+ * least-privilege default a scope-less token would be read-only and refused the
+ * write, so the baseline token grants `write` explicitly — the shape production
+ * mints for an ingest credential.
  */
-const DEVICE: DevicePrincipal = { kind: "device", projectId: PROJECT, tokenId: "tok_valid" };
+const DEVICE: DevicePrincipal = {
+  kind: "device",
+  projectId: PROJECT,
+  tokenId: "tok_valid",
+  scopes: "read write",
+};
 
 /** The exact server instant every test records against. */
 const SERVER_NOW = 1_700_000_000_123;
@@ -343,7 +351,7 @@ describe("POST /v1/telemetry — authentication", () => {
 
   it("attributes samples to the project returned by the verifier", async () => {
     const h = harness({
-      verifyToken: async () => ({ kind: "device", projectId: "proj_other" }),
+      verifyToken: async () => ({ kind: "device", projectId: "proj_other", scopes: "read write" }),
     });
     await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-8" });
 
@@ -398,13 +406,18 @@ describe("POST /v1/telemetry — write authorization (shared scope gate)", () =>
     expect(h.sink.last()!.device).toBe("dev-wo");
   });
 
-  it("accepts an unrestricted device token (no scopes) with 204", async () => {
-    // The default harness token has no `scopes`, i.e. "not restricted".
-    const h = harness();
+  it("refuses an unrestricted/scope-less token with 403 (least-privilege default)", async () => {
+    // A token minted WITHOUT an explicit scope no longer means "unrestricted".
+    // The default is read-only, so this credential may read but may not write
+    // — the least-privilege fix. (Previously this shape wrote successfully.)
+    const h = harness({
+      verifyToken: async (token) => (token === TOKEN ? { ...DEVICE, scopes: undefined } : null),
+    });
     const res = await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-any" });
 
-    expect(res.status).toBe(204);
-    expect(h.sink.size).toBe(1);
+    expect(res.status).toBe(403);
+    expect((await errorOf(res)).error).toBe("insufficient_scope");
+    expect(h.sink.size).toBe(0);
   });
 
   it("a read-scoped token is refused BEFORE the body is validated (403, not 400)", async () => {
@@ -572,7 +585,7 @@ describe("createTelemetryIngestHandler", () => {
     const sink = new InMemoryTelemetrySink();
     const devices = new InMemoryDeviceRegistry();
     const handler = createTelemetryIngestHandler({
-      verifyToken: async () => ({ kind: "device", projectId: PROJECT }),
+      verifyToken: async () => ({ kind: "device", projectId: PROJECT, scopes: "read write" }),
       sink,
       devices,
       now: () => SERVER_NOW,
