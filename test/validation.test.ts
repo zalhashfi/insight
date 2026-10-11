@@ -133,3 +133,68 @@ describe("validation — finite check is load-bearing", () => {
     expect(Number.isFinite(Number.NaN)).toBe(false); // ... but not finite.
   });
 });
+
+// ---------------------------------------------------------------------------
+// Boundary EQUALITY tests (added in verification of 01-01).
+//
+// Every rule above tested `limit + 1` (rejection side). Nothing pinned the
+// ACCEPT side, so an off-by-one regression (`>` becoming `>=`) would still
+// pass the suite. These tests assert the exact boundary is ACCEPTED.
+// ---------------------------------------------------------------------------
+describe("validation — boundaries are inclusive (accept side)", () => {
+  // Pad a valid payload (numeric value, short key) to an exact byte length
+  // using an extra field the validators ignore. Keeps every rule satisfied so
+  // only the SIZE gate is under test.
+  function bodyOfExactBytes(target: number): string {
+    const base = (pad: number) =>
+      `{"metrics":[{"key":"k","value":1,"pad":"${"x".repeat(Math.max(pad, 0))}"}]}`;
+    // Solve for pad: byte length grows 1:1 with pad for ASCII 'x'.
+    let pad = target - new TextEncoder().encode(base(0)).length;
+    let body = base(pad);
+    // Correct for any rounding.
+    while (new TextEncoder().encode(body).length < target) body = base(++pad);
+    while (new TextEncoder().encode(body).length > target) body = base(--pad);
+    return body;
+  }
+
+  it("accepts a payload whose UTF-8 size is EXACTLY maxBytes", () => {
+    const body = bodyOfExactBytes(limits.maxBytes);
+    expect(new TextEncoder().encode(body).length).toBe(limits.maxBytes); // precondition
+    const res = validateTelemetry(body);
+    expect(res.ok).toBe(true);
+  });
+
+  it("rejects a payload one byte OVER maxBytes", () => {
+    const body = bodyOfExactBytes(limits.maxBytes + 1);
+    expect(new TextEncoder().encode(body).length).toBe(limits.maxBytes + 1); // precondition
+    const res = validateTelemetry(body);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe("payload_too_large");
+  });
+
+  it("accepts EXACTLY maxMetrics metrics", () => {
+    const metrics = Array.from({ length: limits.maxMetrics }, (_, i) => ({ key: `k${i}`, value: i }));
+    const res = validateTelemetry({ metrics });
+    expect(res.ok).toBe(true);
+  });
+
+  it("rejects maxMetrics + 1 metrics", () => {
+    const metrics = Array.from({ length: limits.maxMetrics + 1 }, (_, i) => ({ key: `k${i}`, value: i }));
+    const res = validateTelemetry({ metrics });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe("too_many_metrics");
+  });
+
+  it("accepts a key of EXACTLY maxKeyLength (ASCII)", () => {
+    const key = "a".repeat(limits.maxKeyLength);
+    const res = validateTelemetry({ metrics: [{ key, value: 1 }] });
+    expect(res.ok).toBe(true);
+  });
+
+  it("rejects a key of maxKeyLength + 1", () => {
+    const key = "a".repeat(limits.maxKeyLength + 1);
+    const res = validateTelemetry({ metrics: [{ key, value: 1 }] });
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.code).toBe("invalid_key");
+  });
+});
