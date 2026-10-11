@@ -126,6 +126,7 @@ const TEMP_RULE: Rule = {
 // ---------------------------------------------------------------------------
 
 class RecordingTransport implements IntegrationTransport {
+  readonly kind = "dry-run" as const;
   readonly sent: RenderedRequest[] = [];
   private readonly response: TransportResponse;
 
@@ -331,6 +332,7 @@ function harness(options: {
         scopes,
         code_challenge: challenge,
         expires_at: FIXED_NOW + 600_000,
+        projectId: PROJECT,
       };
       grants.putCode(grant);
     },
@@ -450,6 +452,69 @@ describe("M4 e2e — a standard MCP client reads and writes via the composed app
     const h = harness();
     const read = await h.app.request(`/v1/mcp/read?tool=get_state&projectId=${PROJECT}`);
     expect(read.status).toBe(401);
+  });
+});
+
+// ===========================================================================
+// 1b. Tenant isolation through the composed app (the BLOCKER's acceptance)
+//
+// The credential the OAuth exchange mints is bound to a tenant (the code's
+// `projectId`), the gate carries it onto the principal, and the tool layer
+// refuses any call naming a different project. These cases prove it end-to-end
+// through `createApp` — not with a hand-built principal — for reads AND writes.
+// ===========================================================================
+describe("M4 e2e — a tenant-bound credential cannot cross tenants", () => {
+  it("refuses a cross-tenant READ (403) and never returns the other tenant's data", async () => {
+    const h = harness();
+    const token = await exchangeFor(h, [READ_SCOPE]);
+
+    const read = await gatedResult(h.app, `/v1/mcp/read?tool=get_state&projectId=${OTHER_PROJECT}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    // The gate authorized the read class; the tool refused the foreign tenant.
+    expect(read.status).toBe(200);
+    expect(read.envelope.ok).toBe(false);
+    expect(read.envelope.error).toBe("forbidden");
+    // The foreign tenant's id (and any of its rows) never appears in the body.
+    expect(read.raw).not.toContain(OTHER_PROJECT);
+    expect(read.raw).not.toContain("secret_of_other");
+  });
+
+  it("refuses a cross-tenant WRITE (403) and leaves the other tenant's store untouched", async () => {
+    const h = harness();
+    const token = await exchangeFor(h, [MANAGE_SCOPE]);
+
+    const write = await gatedResult(h.app, "/v1/mcp/write", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({
+        tool: "set_variable",
+        args: { projectId: OTHER_PROJECT, key: "temp", value: 999 },
+      }),
+    });
+    expect(write.status).toBe(200);
+    expect(write.envelope.ok).toBe(false);
+    expect(write.envelope.error).toBe("forbidden");
+    // The foreign tenant was never written.
+    expect(h.stores.variables.get(OTHER_PROJECT)).toBeUndefined();
+  });
+
+  it("still serves the SAME credential WITHIN its own tenant (read + write)", async () => {
+    const h = harness();
+    const token = await exchangeFor(h, [MANAGE_SCOPE]);
+
+    const read = await gatedResult(h.app, `/v1/mcp/read?tool=get_state&projectId=${PROJECT}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    expect(read.envelope.ok).toBe(true);
+
+    const write = await gatedResult(h.app, "/v1/mcp/write", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}`, "content-type": "application/json" },
+      body: JSON.stringify({ tool: "set_variable", args: { projectId: PROJECT, key: "temp", value: 8 } }),
+    });
+    expect(write.envelope.ok).toBe(true);
+    expect(h.stores.variables.get(PROJECT)?.get("temp")?.value).toBe(8);
   });
 });
 

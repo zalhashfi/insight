@@ -21,6 +21,7 @@ import {
 import {
   MANAGE_SCOPE,
   READ_SCOPE,
+  type McpCredential,
   type McpScope,
 } from "../../worker/src/mcp/gate";
 import type { Principal } from "../../worker/src/platform/middleware/resolve-project";
@@ -41,6 +42,10 @@ import type { Rule } from "../../worker/src/platform/engine/run";
  *      and the dispatch refuses one a caller might guess at.
  *   4. **Secrets never appear** — a secret placed in an integration config does
  *      not appear, verbatim, in the serialized output of ANY tool.
+ *   5. **A scope is not a tenant** — a credential bound to one project is
+ *      refused a call naming another, for **reads as well as writes**, through
+ *      the REAL gate path (the verifier mints the principal; the tool layer
+ *      enforces the tenant). Within-tenant calls succeed.
  */
 
 // ---------------------------------------------------------------------------
@@ -61,8 +66,17 @@ const SCOPES_BY_TOKEN: Record<string, readonly McpScope[]> = {
   [MANAGE_TOKEN]: [MANAGE_SCOPE],
 };
 
-const verifyToken = async (token: string): Promise<readonly McpScope[] | null> =>
-  SCOPES_BY_TOKEN[token] ?? null;
+/**
+ * The verifier the bridge mounts: a recognised token resolves to a credential
+ * **bound to {@link PROJECT}** — the tenant its grant named. The gate refuses a
+ * tenant-less credential, so a real deploy's verifier always binds one; this
+ * stub does the same, which is what makes the cross-tenant tests exercise the
+ * real gate + tool path rather than a hand-built principal.
+ */
+const verifyToken = async (token: string): Promise<McpCredential | null> => {
+  const scopes = SCOPES_BY_TOKEN[token];
+  return scopes === undefined ? null : { scopes, projectId: PROJECT };
+};
 
 const bearer = (token: string): Record<string, string> => ({ Authorization: `Bearer ${token}` });
 
@@ -395,10 +409,58 @@ describe("mcp tools — write semantics", () => {
   });
 
   it("refuses a device principal writing to another tenant (forbidden)", async () => {
-    const { set } = tools();
+    const { set, fake } = tools();
     const device: Principal = { kind: "device", projectId: PROJECT, scopes: "read write" };
     await expect(
       set.call("set_variable", { projectId: OTHER_PROJECT, key: "temp", value: 1 }, device),
+    ).rejects.toMatchObject({ code: "forbidden" });
+    // The foreign tenant's store was never touched.
+    expect(fake.variables.get(OTHER_PROJECT)).toBeUndefined();
+  });
+
+  it("refuses a device principal READING another tenant (forbidden) — scope is not a tenant", async () => {
+    // A read is a copy of another tenant's data, so the SAME binding applies.
+    // A `read write` device principal bound to PROJECT may not read OTHER.
+    const { set } = tools();
+    const device: Principal = { kind: "device", projectId: PROJECT, scopes: "read write" };
+    await expect(
+      set.call("get_state", { projectId: OTHER_PROJECT }, device),
+    ).rejects.toMatchObject({ code: "forbidden" });
+    await expect(
+      set.call("list_integrations", { projectId: OTHER_PROJECT }, device),
+    ).rejects.toMatchObject({ code: "forbidden" });
+  });
+
+  it("refuses an UNBOUND device principal (empty tenant) for both read and write — fail-closed", async () => {
+    // The exact hole: a principal whose credential carried no tenant. It must be
+    // authorized for nothing, not for everything.
+    const { set } = tools();
+    const unbound: Principal = { kind: "device", projectId: "", scopes: "read write" };
+    await expect(
+      set.call("get_state", { projectId: PROJECT }, unbound),
+    ).rejects.toMatchObject({ code: "forbidden" });
+    await expect(
+      set.call("set_variable", { projectId: PROJECT, key: "temp", value: 1 }, unbound),
+    ).rejects.toMatchObject({ code: "forbidden" });
+  });
+
+  it("allows a device principal within its own tenant for reads AND writes", async () => {
+    // The other half of the contract: the binding must not over-refuse.
+    const { set, fake } = tools();
+    const device: Principal = { kind: "device", projectId: PROJECT, scopes: "read write" };
+    const state = asShape<{ state: StateRow[] }>(
+      await set.call("get_state", { projectId: PROJECT }, device),
+    );
+    expect(state.state).toHaveLength(1);
+    await set.call("set_variable", { projectId: PROJECT, key: "temp", value: 55 }, device);
+    expect(fake.variables.get(PROJECT)?.get("temp")?.value).toBe(55);
+  });
+
+  it("refuses a NON-MEMBER user reading a foreign tenant (forbidden)", async () => {
+    const { set } = tools();
+    const outsider: Principal = { kind: "user", userId: "outsider", projectId: OTHER_PROJECT, role: "member" };
+    await expect(
+      set.call("get_state", { projectId: PROJECT }, outsider),
     ).rejects.toMatchObject({ code: "forbidden" });
   });
 
@@ -547,5 +609,73 @@ describe("mcp tools — composition", () => {
     });
     expect(write.status).toBe(200);
     expect(fake.variables.get(PROJECT)?.get("temp")?.value).toBe(7);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 7. Tenant isolation end-to-end — through the REAL gate path
+//
+// The gate mints the principal from the credential's tenant; the tool layer
+// enforces it. These cases drive the composed bridge (gate + tools) exactly as
+// a deploy mounts it, so a hand-built principal cannot paper over a hole: the
+// credential the verifier binds to PROJECT is refused a call naming OTHER.
+// ---------------------------------------------------------------------------
+
+describe("mcp tools — tenant isolation through the real gate path", () => {
+  /** The composed bridge, over an isolated store bundle, for cross-tenant cases. */
+  function composedBridge(): { app: Hono; fake: InMemoryMcpToolStores } {
+    const fake = stores();
+    const app = new Hono();
+    app.route(
+      "/v1/mcp",
+      createMcpToolRoutes({ ...fake.seams, gate: { verifyToken, mcpWriteEnabled: true } }),
+    );
+    return { app, fake };
+  }
+
+  it("a token bound to PROJECT is REFUSED a cross-tenant read (forbidden, no data)", async () => {
+    const { app } = composedBridge();
+
+    const read = await readCall(app, READ_TOKEN, "get_state", { projectId: OTHER_PROJECT });
+    expect(read.status).toBe(200); // the gate authorized the READ class...
+    expect(read.error).toBe("forbidden"); // ...but the tenant check refused the target
+    // No data from the foreign tenant crossed the wire — only the refusal.
+    expect(read.raw).toContain("forbidden");
+    expect(read.raw).not.toContain(OTHER_PROJECT);
+
+    // And it really did not read: the other tenant's integrations are likewise
+    // refused, so no read tool leaks a foreign tenant.
+    const integrations = await readCall(app, READ_TOKEN, "list_integrations", { projectId: OTHER_PROJECT });
+    expect(integrations.error).toBe("forbidden");
+  });
+
+  it("a manage token bound to PROJECT is REFUSED a cross-tenant write (forbidden, store untouched)", async () => {
+    const { app, fake } = composedBridge();
+
+    const write = await writeCall(app, MANAGE_TOKEN, "set_variable", {
+      projectId: OTHER_PROJECT,
+      key: "temp",
+      value: 99,
+    });
+    expect(write.status).toBe(200); // gate authorized the WRITE class...
+    expect(write.error).toBe("forbidden"); // ...but the tenant check refused the target
+    expect(fake.variables.get(OTHER_PROJECT)).toBeUndefined();
+  });
+
+  it("the SAME token succeeds WITHIN its own tenant for both read and write", async () => {
+    const { app, fake } = composedBridge();
+
+    const read = await readCall(app, READ_TOKEN, "get_project", { projectId: PROJECT });
+    expect(read.status).toBe(200);
+    expect(read.error).toBeUndefined();
+
+    const write = await writeCall(app, MANAGE_TOKEN, "set_variable", {
+      projectId: PROJECT,
+      key: "temp",
+      value: 5,
+    });
+    expect(write.status).toBe(200);
+    expect(write.error).toBeUndefined();
+    expect(fake.variables.get(PROJECT)?.get("temp")?.value).toBe(5);
   });
 });

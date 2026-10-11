@@ -31,6 +31,21 @@
  * write tool has: there is no alternate entry that could serve a mutation to a
  * read-scoped caller, and {@link McpTools.read} refuses a write name outright.
  *
+ * ## A scope is not a tenant — every call is tenant-checked
+ *
+ * The gate authenticates a credential and gives it a tenant (its `projectId`).
+ * But a tool call *names* a project in its arguments, and a scope alone does not
+ * prove the caller may touch that project: a manage-scoped bridge key would
+ * otherwise read and write any tenant. So **both** paths re-check the tenant at
+ * the tool boundary: the read dispatch calls `authorizeRead` and the write
+ * dispatch calls `authorizeWrite`, each requiring the principal's tenant to
+ * equal the project the call names. A device/MCP principal is bound to exactly
+ * one tenant (empty ⇒ refused, fail-closed); a user must be a member (any role
+ * reads, owner/admin writes). This mirrors the shared middleware's INV-A1/A5
+ * rule — the tenant comes from the credential, and a claim that does not match
+ * it is refused — so a bridge call cannot cross a tenant boundary the REST
+ * surface would not.
+ *
  * ## No delete tool exists
  *
  * Deliberately. The mutation surface an AI client can reach is
@@ -69,6 +84,7 @@ import {
   READ_SCOPE,
   createMcpGate,
   type McpCallHandler,
+  type McpCredential,
   type McpGateDeps,
   type McpScope,
   type VerifyMcpToken,
@@ -736,21 +752,64 @@ export function createMcpTools(deps: McpToolDeps): McpTools {
   }
 
   /**
+   * Authorize a **read** against a project.
+   *
+   * A read is not free: reading another tenant's state, series, dashboards or
+   * integrations is exactly the leak this refuses. The rule is the same one the
+   * write path uses and the same the shared middleware enforces (INV-A1/A5):
+   *
+   *   * a `device` principal (an MCP bearer, a project token) is bound to
+   *     **one** tenant — the `projectId` its credential carried through the
+   *     gate. A read of any other project is refused, and so is a read by an
+   *     **unbound** principal (`projectId === ""`): a credential that names no
+   *     project may read none, which is the fail-closed direction;
+   *   * a `user` principal must be a **member** of the project — any role may
+   *     read, but a non-member may not. A project that does not exist at all is
+   *     `not_found` (a missing resource, not a boundary the caller owns), while
+   *     a project that exists but the user is not in is `forbidden`.
+   *
+   * Matching is exact and total; there is no prefix or wildcard that could turn
+   * "the tenant I hold" into "every tenant".
+   */
+  async function authorizeRead(principal: Principal, projectId: string): Promise<void> {
+    if (principal.kind === "device") {
+      // A device/MCP principal is bound to one tenant. A read of any other —
+      // or from an unbound credential — is refused outright, with no existence
+      // probe, so a foreign id is never an oracle.
+      if (principal.projectId === "" || principal.projectId !== projectId) {
+        throw new McpToolError("forbidden", "the credential does not grant access to this project");
+      }
+      return;
+    }
+    // A user must be a member. Distinguish "no such project" (404) from "not
+    // yours" (403): the former is a missing resource, the latter a refusal.
+    await requireProject(projectId);
+    const role = await deps.projects.roleOf(projectId, principal.userId);
+    if (role === null) {
+      throw new McpToolError("forbidden", "the caller is not a member of this project");
+    }
+  }
+
+  /**
    * Authorize a **write** against a project.
    *
    * The caller already holds `mcp:manage` (the gate decided that), but a scope
    * is a bridge capability, not a tenant role: the actor must *also* be allowed
-   * to mutate the named project. A `device` principal (a project token) is
-   * scoped to its own project, so it may write only there; a `user` principal
-   * must be a member with a mutating role. This is the second lock — the same
-   * owner/admin distinction the admin routes enforce — applied at the bridge so
-   * a manage-scoped token cannot mutate a tenant it does not belong to.
+   * to mutate the named project. A `device` principal (a project token, or an
+   * MCP bearer bound to a tenant) is scoped to its own project, so it may write
+   * only there — an **unbound** principal (`projectId === ""`) is refused
+   * outright, because a credential with no tenant may write to none. A `user`
+   * principal must be a member with a mutating role. This is the second lock —
+   * the same owner/admin distinction the admin routes enforce — applied at the
+   * bridge so a manage-scoped token cannot mutate a tenant it does not belong
+   * to.
    */
   async function authorizeWrite(principal: Principal, projectId: string, actorId: string): Promise<void> {
     if (principal.kind === "device") {
-      // A device principal carries its own tenant; a write to any other tenant
-      // is refused, because the token's scope is that one project.
-      if (principal.projectId !== "" && principal.projectId !== projectId) {
+      // A device principal carries its own tenant; a write to any other tenant —
+      // or from an unbound credential — is refused, because the token's scope is
+      // that one project.
+      if (principal.projectId === "" || principal.projectId !== projectId) {
         throw new McpToolError("forbidden", "the credential does not grant access to this project");
       }
       return;
@@ -774,31 +833,40 @@ export function createMcpTools(deps: McpToolDeps): McpTools {
     switch (name) {
       case "list_projects": {
         const all = await deps.projects.listProjects();
-        if (principal.kind === "user") {
-          // A human sees only the projects they belong to.
-          const visible: Project[] = [];
-          for (const project of all) {
-            if (await deps.projects.roleOf(project.id, principal.userId)) visible.push(project);
-          }
+        if (principal.kind === "device") {
+          // A device principal sees exactly its own tenant — never the whole
+          // installation. An unbound device principal (`projectId === ""`) sees
+          // nothing, the fail-closed direction rather than an all-tenant list.
+          const visible = principal.projectId === "" ? [] : all.filter((p) => p.id === principal.projectId);
           return { projects: visible };
         }
-        return { projects: all };
+        // A human sees only the projects they belong to.
+        const visibleForUser: Project[] = [];
+        for (const project of all) {
+          if (await deps.projects.roleOf(project.id, principal.userId)) visibleForUser.push(project);
+        }
+        return { projects: visibleForUser };
       }
       case "get_project": {
-        return { project: await requireProject(reqString(args, "projectId")) };
+        const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
+        return { project: await requireProject(projectId) };
       }
       case "list_variables": {
         const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
         const variables = await deps.variables.list(projectId);
         return { variables };
       }
       case "get_state": {
         const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
         const state = await deps.state.read(projectId, optString(args, "device"), optString(args, "variable"));
         return { state };
       }
       case "get_series": {
         const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
         const variable = reqString(args, "variable");
         const windowMs = optNumber(args, "windowMs") ?? 60 * 60 * 1000;
         if (windowMs < 0) {
@@ -808,33 +876,42 @@ export function createMcpTools(deps: McpToolDeps): McpTools {
         return { series };
       }
       case "list_dashboards": {
-        const layouts = await deps.layouts.list(reqString(args, "projectId"));
+        const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
+        const layouts = await deps.layouts.list(projectId);
         return { dashboards: layouts };
       }
       case "get_dashboard": {
         const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
         const dashboardId = reqString(args, "dashboardId");
         const layout = await deps.layouts.get(projectId, dashboardId);
         if (layout === null) throw new McpToolError("not_found", `no such dashboard: ${dashboardId}`);
         return { dashboard: layout };
       }
       case "list_automations": {
-        const automations = await deps.automations.list(reqString(args, "projectId"));
+        const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
+        const automations = await deps.automations.list(projectId);
         return { automations };
       }
       case "get_automation": {
         const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
         const automationId = reqString(args, "automationId");
         const automation = await deps.automations.get(projectId, automationId);
         if (automation === null) throw new McpToolError("not_found", `no such automation: ${automationId}`);
         return { automation };
       }
       case "list_integrations": {
-        const integrations = await deps.integrations.list(reqString(args, "projectId"));
+        const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
+        const integrations = await deps.integrations.list(projectId);
         return { integrations };
       }
       case "get_integration": {
         const projectId = reqString(args, "projectId");
+        await authorizeRead(principal, projectId);
         const integrationId = reqString(args, "integrationId");
         const integration = await deps.integrations.get(projectId, integrationId);
         if (integration === null) throw new McpToolError("not_found", `no such integration: ${integrationId}`);
@@ -1353,5 +1430,5 @@ function assertDeps(deps: McpToolDeps): void {
   }
 }
 
-export type { McpCallHandler, McpGateDeps, VerifyMcpToken };
+export type { McpCallHandler, McpCredential, McpGateDeps, VerifyMcpToken };
 export { hasScope };

@@ -51,6 +51,17 @@
  * checked **first**, so a caller missing the capability can never learn the
  * flag's state — the flag's position is not an existence oracle.
  *
+ * ## A scope is not a tenant — the credential carries a project
+ *
+ * A scope says *what* a credential may do; it says nothing about *which tenant*
+ * it may do it in. So the credential a token resolves to is not a bare scope
+ * list but an {@link McpCredential}: the scopes **and** the `projectId` the
+ * token is bound to. The gate refuses a credential with no tenant (`401`,
+ * fail-closed), and the tenant is projected onto the {@link Principal} so the
+ * tool layer can refuse any call whose project argument is not that tenant —
+ * for reads as well as writes. That is what keeps a manage-scoped bridge key
+ * from being an all-tenant superuser.
+ *
  * ## OAuth 2.1 (RFC 8414 + RFC 6749 §4.1/§6, PKCE mandated)
  *
  * `/v1/mcp/oauth` is a *token endpoint* (+ discovery document). It is not a
@@ -128,15 +139,22 @@ export const READ_SCOPE: McpScope = "mcp:read";
 export const MANAGE_SCOPE: McpScope = "mcp:manage";
 
 /**
- * Project a set of MCP scopes onto the shared {@link DevicePrincipal}
- * vocabulary — the *one* place a scope list becomes a principal.
+ * Project a set of MCP scopes **and a tenant** onto the shared
+ * {@link DevicePrincipal} vocabulary — the *one* place a credential becomes a
+ * principal.
  *
- * A `device`-kind principal whose `scopes` is the capability projection is
- * exactly the shape {@link hasScope} understands, so the read/write decision is
- * the same code path the middleware and the telemetry routes use — `write` is
- * present only when a scope granted it explicitly ({@link CAPABILITIES_BY_SCOPE}).
+ * A `device`-kind principal whose `scopes` is the capability projection and
+ * whose `projectId` is the credential's tenant is exactly the shape
+ * {@link hasScope} understands, so the read/write decision is the same code
+ * path the middleware and the telemetry routes use — `write` is present only
+ * when a scope granted it explicitly ({@link CAPABILITIES_BY_SCOPE}), and the
+ * tenant rides on the principal so every downstream handler can enforce it.
+ *
+ * `projectId` defaults to `""` only so a *scope-projection* caller (one with no
+ * tenant to bind) keeps compiling; the gate never passes an empty tenant
+ * through — it refuses one first (see {@link gate}).
  */
-export function principalForScopes(scopes: readonly McpScope[]): DevicePrincipal {
+export function principalForScopes(scopes: readonly McpScope[], projectId = ""): DevicePrincipal {
   const granted = new Set<string>();
   for (const scope of scopes) {
     for (const capability of CAPABILITIES_BY_SCOPE[scope].split(/\s+/)) {
@@ -145,7 +163,7 @@ export function principalForScopes(scopes: readonly McpScope[]): DevicePrincipal
   }
   return {
     kind: "device",
-    projectId: "",
+    projectId,
     scopes: Array.from(granted).join(" "),
   };
 }
@@ -188,17 +206,41 @@ export const MCP_STATUS = {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolve a presented bearer token to the set of MCP scopes it holds.
+ * What a presented bearer token resolves to: the MCP scopes it holds **and**
+ * the tenant it is bound to.
+ *
+ * The tenant is not optional decoration — it is the whole point. A scope says
+ * *what* a credential may do; `projectId` says *which tenant* it may do it in.
+ * Without it a manage-scoped bridge key would be an all-tenant superuser, which
+ * is precisely the cross-tenant hole this shape closes: the gate now refuses a
+ * credential with no tenant (`401`), and a handler refuses any call whose
+ * project argument is not that tenant.
+ */
+export interface McpCredential {
+  /** The MCP scopes this credential holds. Empty means "holds nothing". */
+  readonly scopes: readonly McpScope[];
+  /**
+   * The tenant this credential is bound to. `""` / absent means "unbound" and
+   * is refused at the gate — a credential with no project is authorized for no
+   * project, so a half-configured verifier fails closed rather than open.
+   */
+  readonly projectId: string;
+}
+
+/**
+ * Resolve a presented bearer token to its {@link McpCredential}, or `null`.
  *
  * Production verifies the plaintext against its token store (a `user_tokens`
- * lookup yielding `read`/`admin`, projected onto MCP scopes); tests pass a
- * stub. Returning `null` — or throwing — means "not usable", and the route
- * answers `401`; the two are deliberately indistinguishable so a caller cannot
- * probe *why* a token failed.
+ * lookup yielding `read`/`admin` **and the token's bound `projectId`**,
+ * projected onto MCP scopes); tests pass a stub. Returning `null` — or
+ * throwing — means "not usable", and the route answers `401`; the two are
+ * deliberately indistinguishable so a caller cannot probe *why* a token failed.
+ * A credential that authenticates but carries no `projectId` is `401` too: a
+ * token that names no tenant can act for none.
  */
 export type VerifyMcpToken = (
   token: string,
-) => Promise<readonly McpScope[] | null>;
+) => Promise<McpCredential | null>;
 
 /** Everything the `/v1/mcp` gate needs, injectable end-to-end. */
 export interface McpGateDeps {
@@ -320,20 +362,29 @@ async function gate(
   // 2. Resolve. A throwing verifier is a refusal, never a 500. A token that
   //    authenticates as holding NOTHING is authorized for nothing either — the
   //    least-privilege default says an empty capability set holds no `read`.
-  let scopes: readonly McpScope[] | null;
+  //    The same is true of a token that names NO tenant: a scope acts *within*
+  //    a project, so a credential with an empty `projectId` is refused here
+  //    (fail-closed) rather than reaching a handler able to touch any tenant.
+  let credential: McpCredential | null;
   try {
-    scopes = await deps.verifyToken(token);
+    credential = await deps.verifyToken(token);
   } catch {
-    scopes = null;
+    credential = null;
   }
-  if (scopes === null || scopes.length === 0) {
+  if (
+    credential === null ||
+    credential.scopes.length === 0 ||
+    typeof credential.projectId !== "string" ||
+    credential.projectId.trim() === ""
+  ) {
     return refuse(MCP_STATUS.unauthorized, "unauthorized");
   }
 
   // 3. Authorize through the SHARED gate. There is no MCP-local capability
   //    check: the principal IS the scope projection and `hasScope` is the one
-  //    decision, so a `mcp:read` token is refused `mcp:manage` for free.
-  const principal = principalForScopes(scopes);
+  //    decision, so a `mcp:read` token is refused `mcp:manage` for free. The
+  //    tenant rides on the principal, so a handler can enforce it.
+  const principal = principalForScopes(credential.scopes, credential.projectId);
   if (!hasScope(principal, CAPABILITY_BY_SCOPE[required])) {
     return refuse(MCP_STATUS.forbidden, "insufficient_scope");
   }
@@ -389,7 +440,7 @@ export function createMcpGate(deps: McpGateDeps): Hono {
 // OAuth 2.1 — shapes
 // ---------------------------------------------------------------------------
 
-/** RFC 6749 §5.1 token response. */
+/** RFC 6749 §5.1 token response, plus one documented non-standard extension. */
 export interface OAuthTokenBody {
   readonly access_token: string;
   readonly token_type: "bearer";
@@ -397,6 +448,12 @@ export interface OAuthTokenBody {
   /** The granted scope — a space-delimited subset of {@link MCP_SCOPES}. */
   readonly scope: string;
   readonly refresh_token?: string;
+  /**
+   * NON-STANDARD extension: the refresh-token lifetime in seconds. RFC 6749
+   * §5.1 defines only `expires_in` (the *access*-token lifetime) and leaves the
+   * refresh window undefined; this field names it explicitly so a client does
+   * not have to guess. Present only alongside `refresh_token`.
+   */
   readonly refresh_token_expires_in?: number;
 }
 
@@ -414,23 +471,38 @@ export type OAuthErrorCode =
   | "unsupported_grant_type"
   | "invalid_scope";
 
-/** RFC 8414 authorization-server metadata document. */
+/**
+ * RFC 8414 authorization-server metadata document.
+ *
+ * There is deliberately **no `authorization_endpoint`**. This surface is a
+ * *token endpoint* (+ discovery) only: it consumes an authorization code the
+ * caller already holds from an upstream consent screen; it does not run an
+ * authorization endpoint itself. Advertising one would hand a stock client a
+ * URL that does not exist (a `404` after redirect) — the mismatch this document
+ * no longer claims. `refresh_token_expires_in` is likewise not part of RFC 8414
+ * (nor of RFC 6749 §5.1); it is a **non-standard extension** carried here and
+ * on the token response so a client can learn the refresh window without trial.
+ */
 export interface OAuthDiscoveryBody {
   readonly issuer: string;
-  readonly authorization_endpoint: string;
   readonly token_endpoint: string;
   readonly token_endpoint_auth_methods_supported: readonly string[];
   readonly scopes_supported: readonly string[];
   readonly response_types_supported: readonly string[];
   readonly grant_types_supported: readonly string[];
   readonly code_challenge_methods_supported: readonly string[];
+  /**
+   * NON-STANDARD extension (not in RFC 8414): the refresh-token lifetime in
+   * seconds, advertising the window a client may rotate within.
+   */
   readonly refresh_token_expires_in?: number;
 }
 
 /**
  * An authorization code a caller presents for exchange — the state minted by the
  * (upstream) consent step and consumed here. `scopes` is the granted set;
- * `code_challenge` is the PKCE S256 challenge bound at issue time.
+ * `code_challenge` is the PKCE S256 challenge bound at issue time; `projectId`
+ * is the tenant the grant is bound to (the token minted from it inherits it).
  */
 export interface AuthorizationCode {
   readonly code: string;
@@ -439,6 +511,11 @@ export interface AuthorizationCode {
   readonly scopes: readonly McpScope[];
   readonly code_challenge: string;
   readonly expires_at: number;
+  /**
+   * The tenant this grant authorizes. Carried onto the access token so the
+   * bridge acts within exactly one project — a code is never tenant-free.
+   */
+  readonly projectId: string;
 }
 
 /** A stored refresh token — the long-lived grant a client rotates. */
@@ -447,6 +524,8 @@ export interface RefreshToken {
   readonly client_id: string;
   readonly scopes: readonly McpScope[];
   readonly expires_at: number;
+  /** The tenant this grant authorizes; a refresh never changes it. */
+  readonly projectId: string;
 }
 
 /**
@@ -468,16 +547,20 @@ export interface OAuthGrantStore {
 }
 
 /**
- * Mint an access token for `(clientId, scopes)`.
+ * Mint an access token for a `(clientId, scopes, projectId)` grant.
  *
  * The issuer decides the token's *authenticity* (it is what
  * {@link VerifyMcpToken} will accept at `/v1/mcp`), so the two seams together
  * are the whole trust chain: the exchange hands back nothing the gate would not
- * accept.
+ * accept. `projectId` is the grant's tenant — the authorization code is bound
+ * to one project, and the issuer must record that binding so the token carries
+ * the tenant the gate enforces.
  */
 export type IssueMcpAccessToken = (input: {
   readonly clientId: string;
   readonly scopes: readonly McpScope[];
+  /** The tenant the grant is bound to; the token carries it to the gate. */
+  readonly projectId: string;
 }) => Promise<{ readonly token: string; readonly expiresIn: number }>;
 
 /** Everything the OAuth token endpoint needs, injectable end-to-end. */
@@ -611,14 +694,18 @@ export function createMcpOAuth(deps: McpOAuthDeps): Hono {
    * Mint an RFC 6749 §5.1 response for `scopes`, optionally with a refresh
    * token. `refresh_token_expires_in` mirrors the grant's remaining lifetime as
    * the spec's non-mandatory companion to `expires_in`.
+   *
+   * `projectId` is the grant's tenant; it is handed to the issuer so the minted
+   * token is bound to it — the token cannot outgrow the grant it came from.
    */
   const mint = async (
     c: Context,
     clientId: string,
     scopes: readonly McpScope[],
+    projectId: string,
     withRefresh: boolean,
   ): Promise<Response> => {
-    const issued = await deps.issueAccessToken({ clientId, scopes });
+    const issued = await deps.issueAccessToken({ clientId, scopes, projectId });
     const body: OAuthTokenBody = {
       access_token: issued.token,
       token_type: "bearer",
@@ -634,10 +721,15 @@ export function createMcpOAuth(deps: McpOAuthDeps): Hono {
   };
 
   // --- Discovery (RFC 8414) -------------------------------------------------
+  // The document advertises ONLY what this module serves: the token endpoint.
+  // There is no `authorization_endpoint` here because there is no `/authorize`
+  // route — the consent step is upstream, so a client must not be sent to a URL
+  // this server does not answer. `refresh_token_expires_in` is a non-standard
+  // extension (documented on {@link OAuthDiscoveryBody}) that mirrors the token
+  // response's own field.
   app.get("/.well-known/oauth-authorization-server", (c) => {
     const body: OAuthDiscoveryBody = {
       issuer: deps.issuer,
-      authorization_endpoint: `${deps.issuer}/v1/mcp/oauth/authorize`,
       token_endpoint: `${deps.issuer}${TOKEN_PATH}`,
       token_endpoint_auth_methods_supported: [...TOKEN_ENDPOINT_AUTH_METHODS],
       scopes_supported: [...MCP_SCOPES],
@@ -712,7 +804,7 @@ export function createMcpOAuth(deps: McpOAuthDeps): Hono {
       return fail(c, 400, "invalid_grant", "the code_verifier does not match the code_challenge");
     }
 
-    return mint(c, grant.client_id, grant.scopes, true);
+    return mint(c, grant.client_id, grant.scopes, grant.projectId, true);
   }
 
   /** RFC 6749 §6 refresh grant: no escalation — the scope may only narrow. */
@@ -752,9 +844,11 @@ export function createMcpOAuth(deps: McpOAuthDeps): Hono {
     }
 
     // Rotation: the presented refresh token is invalidated and a fresh one
-    // issued in the same response (OAuth 2.1 refresh-token rotation).
+    // issued in the same response (OAuth 2.1 refresh-token rotation). The
+    // grant's tenant rides onto the new token unchanged — a refresh rotates the
+    // credential, never the tenant it acts in.
     await deps.grants.markUsed(refreshToken);
-    return mint(c, grant.client_id, granted, true);
+    return mint(c, grant.client_id, granted, grant.projectId, true);
   }
 
   return app;
@@ -828,19 +922,29 @@ export class InMemoryOAuthGrantStore implements OAuthGrantStore {
  * honest: the token the exchange returns is fed back through
  * {@link createMcpGate} and accepted, so "usable token" is demonstrated rather
  * than asserted in the abstract.
+ *
+ * Every issued token is **bound to a tenant**: the scope list *and* the
+ * `projectId` that requested it are recorded together, so verification yields a
+ * {@link McpCredential} that names the one project the token may act in — the
+ * binding the gate and the tool handlers both enforce.
  */
 export class InMemoryMcpTokenIssuer {
-  readonly #byToken = new Map<string, readonly McpScope[]>();
+  readonly #byToken = new Map<string, McpCredential>();
   #counter = 0;
 
-  /** Issue an access token carrying `scopes`. Never returns the same token twice. */
+  /**
+   * Issue an access token carrying `scopes` bound to `projectId`. Never returns
+   * the same token twice. A missing tenant is stored as `""`, which the gate
+   * refuses — so a caller that forgets to bind cannot mint a usable token.
+   */
   issue(input: {
     readonly clientId: string;
     readonly scopes: readonly McpScope[];
+    readonly projectId?: string;
   }): Promise<{ readonly token: string; readonly expiresIn: number }> {
     this.#counter += 1;
     const token = `mcp_at_${this.#counter}_${input.clientId}`;
-    this.#byToken.set(token, input.scopes);
+    this.#byToken.set(token, { scopes: input.scopes, projectId: input.projectId ?? "" });
     return Promise.resolve({ token, expiresIn: DEFAULT_ACCESS_TTL });
   }
 
@@ -849,8 +953,8 @@ export class InMemoryMcpTokenIssuer {
 
   /** The {@link VerifyMcpToken} seam the `/v1/mcp` gate authenticates against. */
   readonly verifyToken: VerifyMcpToken = (token) => {
-    const scopes = this.#byToken.get(token);
-    return Promise.resolve(scopes === undefined ? null : scopes);
+    const credential = this.#byToken.get(token);
+    return Promise.resolve(credential === undefined ? null : credential);
   };
 }
 

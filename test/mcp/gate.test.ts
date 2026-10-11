@@ -16,7 +16,9 @@ import {
   principalForScopes,
   verifyPkceS256,
   type AuthorizationCode,
+  type McpCredential,
   type McpScope,
+  type RefreshToken,
 } from "../../worker/src/mcp/gate";
 import { base64url } from "../../worker/src/platform/lib/tokens";
 import {
@@ -29,16 +31,19 @@ import {
  *
  * The contracts that carry the security weight:
  *
- *   1. **Auth first** — no / malformed / unknown bearer → `401`.
+ *   1. **Auth first** — no / malformed / unknown / tenant-less bearer → `401`.
  *   2. **Scope is a hard ceiling** — `mcp:read` may read but never write;
  *      `mcp:manage` may do both.
  *   3. **Two keys on the write path** — `mcp:manage` AND `mcp_write_enabled`;
  *      either missing → `403`, with the two conditions distinguishable.
  *   4. **No parallel lattice** — the decision is the SHARED `hasScope`; the MCP
  *      scopes project onto the one capability vocabulary (asserted directly).
- *   5. **OAuth 2.1** — discovery is an RFC 8414 document; a PKCE-bound
- *      authorization-code exchange returns an RFC 6749 §5.1 token that the
- *      `/v1/mcp` gate then *accepts* (a proven-usable token, not a shape guess).
+ *   5. **Tenant binding** — the credential carries a `projectId`; the principal
+ *      the gate mints is bound to it, and a tenant-less credential is refused.
+ *   6. **OAuth 2.1** — discovery is an RFC 8414 document; a PKCE-bound
+ *      authorization-code exchange returns an RFC 6749 §5.1 token bound to the
+ *      grant's tenant, which the `/v1/mcp` gate then *accepts* (a proven-usable
+ *      token, not a shape guess).
  */
 
 // ---------------------------------------------------------------------------
@@ -49,14 +54,26 @@ import {
 const READ_TOKEN = "mcp_read_" + "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const MANAGE_TOKEN = "mcp_manage_" + "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+/** The tenant every recognisable token is bound to (multi-tenant credentials). */
+const GRANT_PROJECT = "proj_gate_test";
+/** A *different* tenant, to prove the binding is not accidentally satisfied. */
+const OTHER_PROJECT = "proj_gate_other";
+
 const SCOPES_BY_TOKEN: Record<string, readonly McpScope[]> = {
   [READ_TOKEN]: ["mcp:read"],
   [MANAGE_TOKEN]: ["mcp:manage"],
 };
 
-/** A verifier backed by {@link SCOPES_BY_TOKEN}; unknown tokens resolve to `null`. */
-const verifyToken = async (token: string): Promise<readonly McpScope[] | null> =>
-  SCOPES_BY_TOKEN[token] ?? null;
+/**
+ * A verifier backed by {@link SCOPES_BY_TOKEN}; unknown tokens resolve to `null`.
+ * A recognised token resolves to a {@link McpCredential} bound to
+ * {@link GRANT_PROJECT} — the gate refuses a credential with no tenant, so the
+ * stub binds one exactly as a real verifier does.
+ */
+const verifyToken = async (token: string): Promise<McpCredential | null> => {
+  const scopes = SCOPES_BY_TOKEN[token];
+  return scopes === undefined ? null : { scopes, projectId: GRANT_PROJECT };
+};
 
 /**
  * Mount the gate exactly as a deploy would (`/v1/mcp`), so every case drives
@@ -121,6 +138,7 @@ async function oauthHarness(options?: {
     scopes: ["mcp:manage"],
     code_challenge: challenge,
     expires_at: issuedAt + 60_000,
+    projectId: GRANT_PROJECT,
   };
   grants.putCode(code);
   const app = new Hono();
@@ -209,6 +227,30 @@ describe("mcp gate — authentication", () => {
     const app = gateApp({ mcpWriteEnabled: true });
     const res = await app.request("/v1/mcp/read");
     expect(res.headers.get("WWW-Authenticate")).toContain("Bearer");
+  });
+
+  it("a credential with NO tenant is refused (401) — a token that names no project acts for none", async () => {
+    // The exact regression this closes: a verifier that authenticates scopes but
+    // forgets the tenant. The key must never reach a handler that could then
+    // touch any project, so the gate refuses it before authorization.
+    const app = new Hono();
+    app.route(
+      "/v1/mcp",
+      createMcpGate({
+        verifyToken: async () => ({ scopes: ["mcp:manage"], projectId: "" }),
+        mcpWriteEnabled: true,
+      }),
+    );
+
+    const read = await app.request("/v1/mcp/read", { headers: bearer("tenantless") });
+    expect(read.status).toBe(401);
+    expect(await read.json()).toMatchObject({ error: "unauthorized" });
+
+    const write = await app.request("/v1/mcp/write", {
+      method: "POST",
+      headers: bearer("tenantless"),
+    });
+    expect(write.status).toBe(401);
   });
 });
 
@@ -363,7 +405,45 @@ describe("mcp gate — one authorization model, no parallel lattice", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 5. OAuth 2.1 — discovery, PKCE, and a proven-usable token
+// 5. The credential carries a tenant — the gate binds the principal to it
+// ---------------------------------------------------------------------------
+
+describe("mcp gate — the credential is tenant-bound", () => {
+  it("principalForScopes binds the tenant onto the principal", () => {
+    const bound: Principal = principalForScopes(["mcp:read"], GRANT_PROJECT);
+    expect(bound.kind).toBe("device");
+    expect(bound.projectId).toBe(GRANT_PROJECT);
+
+    // A scope-projection caller with no tenant is the fail-closed default:
+    // empty, which the tool layer refuses — never a wildcard.
+    const unbound: Principal = principalForScopes(["mcp:read"]);
+    expect(unbound.projectId).toBe("");
+  });
+
+  it("the gate hands the handler a principal bound to the credential's tenant", async () => {
+    let seen: Principal | undefined;
+    const app = new Hono();
+    app.route(
+      "/v1/mcp",
+      createMcpGate({
+        verifyToken: async () => ({ scopes: ["mcp:read"], projectId: OTHER_PROJECT }),
+        read: (_c, principal) => {
+          seen = principal;
+          return { ok: true };
+        },
+      }),
+    );
+
+    const res = await app.request("/v1/mcp/read", { headers: bearer(READ_TOKEN) });
+    expect(res.status).toBe(200);
+    // The handler never sees the raw credential; it sees the tenant the gate
+    // resolved — the value it enforces against the call's project argument.
+    expect(seen?.projectId).toBe(OTHER_PROJECT);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. OAuth 2.1 — discovery, PKCE, and a proven-usable token
 // ---------------------------------------------------------------------------
 
 describe("mcp oauth — discovery (RFC 8414)", () => {
@@ -379,6 +459,43 @@ describe("mcp oauth — discovery (RFC 8414)", () => {
     expect(body.scopes_supported).toEqual(["mcp:read", "mcp:manage"]);
     expect(body.grant_types_supported).toEqual(["authorization_code", "refresh_token"]);
     expect(body.code_challenge_methods_supported).toEqual([PKCE_METHOD]);
+  });
+
+  it("does NOT advertise an authorization_endpoint it does not serve", async () => {
+    // The documented mismatch: the document used to point at `/authorize`,
+    // which is not a route here (the consent step is upstream). A stock client
+    // following it would 404, so the field must be absent — and the URL it used
+    // to name must genuinely not exist.
+    const { app } = await oauthHarness();
+
+    const res = await app.request("/v1/mcp/oauth/.well-known/oauth-authorization-server");
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(body).not.toHaveProperty("authorization_endpoint");
+
+    // Belt-and-braces: the advertised-by-nonexistence URL really is a 404.
+    const wouldBeAuthorize = await app.request("/v1/mcp/oauth/authorize");
+    expect(wouldBeAuthorize.status).toBe(404);
+  });
+
+  it("documents refresh_token_expires_in as a non-standard extension", async () => {
+    // RFC 8414 has no such field; it is carried so a client can learn the
+    // refresh window without trial. Asserted on BOTH the discovery document and
+    // the token response, where the docs say it lives.
+    const { app } = await oauthHarness();
+
+    const discovery = await app.request("/v1/mcp/oauth/.well-known/oauth-authorization-server");
+    const doc = (await discovery.json()) as Record<string, unknown>;
+    expect(typeof doc.refresh_token_expires_in).toBe("number");
+
+    const token = await tokenRequest(app, {
+      grant_type: "authorization_code",
+      code: "authcode_1",
+      client_id: CLIENT,
+      redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
+    });
+    const body = (await token.json()) as Record<string, unknown>;
+    expect(typeof body.refresh_token_expires_in).toBe("number");
   });
 });
 
@@ -504,6 +621,7 @@ describe("mcp oauth — refresh grant (RFC 6749 §6, no escalation)", () => {
       client_id: CLIENT,
       scopes: ["mcp:read", "mcp:manage"],
       expires_at: 10 ** 12,
+      projectId: GRANT_PROJECT,
     });
 
     const res = await tokenRequest(app, {
@@ -526,6 +644,7 @@ describe("mcp oauth — refresh grant (RFC 6749 §6, no escalation)", () => {
       client_id: CLIENT,
       scopes: ["mcp:read", "mcp:manage"],
       expires_at: 10 ** 12,
+      projectId: GRANT_PROJECT,
     });
 
     const narrowed = await tokenRequest(app, {
@@ -561,7 +680,7 @@ describe("mcp oauth — refresh grant (RFC 6749 §6, no escalation)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6. PKCE primitive
+// 7. PKCE primitive
 // ---------------------------------------------------------------------------
 
 describe("mcp oauth — PKCE S256", () => {
@@ -580,7 +699,7 @@ describe("mcp oauth — PKCE S256", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 7. Composition guards
+// 8. Composition guards
 // ---------------------------------------------------------------------------
 
 describe("mcp gate — composition is fail-loud", () => {
