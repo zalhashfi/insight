@@ -90,6 +90,7 @@ import {
   type VerifyMcpToken,
 } from "./gate";
 import { hasScope, type Principal } from "../platform/middleware/resolve-project";
+import { defaultClock } from "../platform/lib/clock";
 import type { Project, Role } from "../domains/projects/membership";
 import type { AutomationRecord } from "../platform/engine/manual-run";
 import type { Rule } from "../platform/engine/run";
@@ -629,9 +630,6 @@ export interface McpToolDeps {
    */
   readonly secrets?: SecretRegistry;
 }
-
-/** Default wall clock. */
-const defaultClock = (): number => Date.now();
 
 // ---------------------------------------------------------------------------
 // Errors

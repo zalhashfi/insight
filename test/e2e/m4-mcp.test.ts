@@ -618,6 +618,42 @@ describe("M4 e2e — an anomaly fires a notification through the integration run
     expect(request.auth.webhook_url).toBe("https://hooks.slack.com/services/T/B/m4-secret-webhook");
   });
 
+  it("drives the engine from the REAL INGEST ROUTE, not just the test seam", async () => {
+    // The production producer: a telemetry POST that persists a reading also
+    // feeds `AnomalyEngine.observe`. This is the wiring the earlier audit found
+    // missing (`anomalyEngineFor` had no production caller). No test seam is
+    // touched here — the engine is reached only through the ingest route.
+    const h = harness();
+
+    const payload = JSON.stringify({ metrics: [{ key: ANOMALY_VARIABLE, value: 42.5 }] });
+    const res = await h.app.request("/v1/telemetry", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        Authorization: "Bearer pt_m4_demo_token",
+      },
+      body: payload,
+    });
+    expect(res.status).toBe(204);
+
+    // The reading crossed the threshold, so the engine emitted and the
+    // notification seam fired a real integration call — with no test-side
+    // `observe()` at all.
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(h.transport.sent).toHaveLength(1);
+    expect(JSON.stringify(h.transport.sent[0].body)).toContain("above_range");
+
+    // A reading under the threshold is persisted but emits nothing.
+    const calm = await h.app.request("/v1/telemetry", {
+      method: "POST",
+      headers: { "content-type": "application/json", Authorization: "Bearer pt_m4_demo_token" },
+      body: JSON.stringify({ metrics: [{ key: ANOMALY_VARIABLE, value: 20 }] }),
+    });
+    expect(calm.status).toBe(204);
+    for (let i = 0; i < 20; i += 1) await Promise.resolve();
+    expect(h.transport.sent).toHaveLength(1);
+  });
+
   it("returns a result whose opened secret is redacted (safe to log)", async () => {
     const h = harness();
     // Driving the notification path once, then inspecting what a caller sees.

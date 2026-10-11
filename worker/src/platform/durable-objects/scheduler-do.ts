@@ -112,13 +112,11 @@
  */
 
 import type { ActionWriteResult } from "../engine/run";
+import type { Clock } from "../lib/clock";
 
 // ---------------------------------------------------------------------------
 // Seams
 // ---------------------------------------------------------------------------
-
-/** A clock returning Unix epoch milliseconds. */
-export type Clock = () => number;
 
 /**
  * The lifecycle states of a delayed action (D3.7).

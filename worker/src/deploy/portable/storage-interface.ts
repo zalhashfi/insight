@@ -90,8 +90,14 @@
 /** Unix epoch milliseconds (UTC) — the repo-wide time unit. */
 export type EpochMs = number;
 
-/** A caller-supplied "now" seam. The store never reaches for a wall clock. */
-export type Clock = () => EpochMs;
+/**
+ * A caller-supplied "now" seam. The store never reaches for a wall clock.
+ *
+ * Re-exported from the shared `Clock` seam (`platform/lib/clock.ts`) so this
+ * backend-neutral contract names the same type the rest of the worker uses —
+ * structurally `() => number`, where the number is millis per {@link EpochMs}.
+ */
+export type { Clock } from "../../platform/lib/clock";
 
 /**
  * A backend-neutral, comparable timestamp as it is handed to the store.

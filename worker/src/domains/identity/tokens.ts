@@ -15,6 +15,7 @@
  */
 
 import { generateToken, hashToken } from "../../platform/lib/tokens";
+import { defaultClock, type Clock } from "../../platform/lib/clock";
 
 /**
  * A stored token record. Mirrors the persisted columns — there is deliberately
@@ -95,12 +96,6 @@ export interface CreateProjectTokenInput {
   /** Optional epoch-ms expiry (defaults to `null` = never expires). */
   readonly expiresAt?: number | null;
 }
-
-/** Clock seam so tests can make timestamps deterministic. */
-export type Clock = () => number;
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock: Clock = () => Date.now();
 
 /** Id seam so tests can make ids deterministic; defaults to a ULID-ish random id. */
 export type IdFactory = () => string;

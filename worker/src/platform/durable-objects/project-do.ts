@@ -41,13 +41,11 @@
  */
 
 import { PROJECT_DDL, projectStatements } from "./project-schema";
+import type { Clock } from "../lib/clock";
 
 // ---------------------------------------------------------------------------
 // Seams
 // ---------------------------------------------------------------------------
-
-/** A clock returning Unix epoch milliseconds. */
-export type Clock = () => number;
 
 /** One telemetry push, as the projection stores it. */
 export interface Push {

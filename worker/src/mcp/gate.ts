@@ -98,6 +98,7 @@ import {
   type Principal,
 } from "../platform/middleware/resolve-project";
 import { base64url } from "../platform/lib/tokens";
+import { defaultClock } from "../platform/lib/clock";
 
 // ---------------------------------------------------------------------------
 // Scope vocabulary — projected onto the shared capability list
@@ -613,9 +614,6 @@ export const GRANT_TYPES_SUPPORTED = ["authorization_code", "refresh_token"] as 
 // ---------------------------------------------------------------------------
 // OAuth 2.1 — helpers
 // ---------------------------------------------------------------------------
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock = (): number => Date.now();
 
 /** Generate an opaque refresh token from the CSPRNG (never `Math.random`). */
 function defaultRefreshTokenFactory(): string {

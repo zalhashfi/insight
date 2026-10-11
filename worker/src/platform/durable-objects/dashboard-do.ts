@@ -84,6 +84,8 @@
  * {@link DashboardDOOptions} — this module defines the hook, nothing more.
  */
 
+import type { Clock } from "../lib/clock";
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -112,9 +114,6 @@ export const DEFAULT_SLOW_CLIENT_THRESHOLD_BYTES = 1_048_576;
 // ---------------------------------------------------------------------------
 // Seams
 // ---------------------------------------------------------------------------
-
-/** A clock returning Unix epoch milliseconds. */
-export type Clock = () => number;
 
 /**
  * One point in a snapshot — a projected reading, in the shape the projection

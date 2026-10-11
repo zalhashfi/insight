@@ -29,6 +29,8 @@
  * is nonetheless pure (no I/O of its own) and therefore trivially unit-tested.
  */
 
+import { defaultClock, type Clock } from "../lib/clock";
+
 /**
  * Minimal seam onto a SQL engine (Cloudflare D1 or a test fake).
  *
@@ -83,12 +85,6 @@ const MIGRATING = -1;
 
 /** Guard/spin-loop tuning for the racy "migrating" state. */
 const MAX_INTERLEAVES = 10_000;
-
-/** Clock seam so tests can make `applied_at` deterministic. */
-export type Clock = () => number;
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock: Clock = () => Date.now();
 
 /** Default async yield (a macrotask turn) used while spinning on the winner. */
 const defaultYield = (): Promise<void> =>

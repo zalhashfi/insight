@@ -7,7 +7,6 @@ import {
   allowList,
   filterPoint,
   isPublicDashboardError,
-  type Clock,
   type DashboardLayout,
   type LayoutLookup,
   type Point,
@@ -16,6 +15,7 @@ import {
   type ShareResolver,
   type TokenHasher,
 } from "../../worker/src/domains/dashboards/public";
+import type { Clock } from "../../worker/src/platform/lib/clock";
 
 /**
  * Spec tests for the public shared-dashboard read path — ST-D2 / INV-D2 (D4.3).

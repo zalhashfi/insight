@@ -89,6 +89,7 @@
  */
 
 import { checkKey, checkValue } from "../../shared/validation";
+import type { Clock } from "../lib/clock";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -117,9 +118,6 @@ export const MAX_TRACKED_RULES = 1024;
 // ---------------------------------------------------------------------------
 // Seams
 // ---------------------------------------------------------------------------
-
-/** A clock returning Unix epoch milliseconds. */
-export type Clock = () => number;
 
 /**
  * The projection port the engine reads conditions from (D3.8).

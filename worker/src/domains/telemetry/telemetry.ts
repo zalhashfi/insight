@@ -64,6 +64,7 @@
 
 import type { Context } from "hono";
 import { Hono } from "hono";
+import { defaultClock, type Clock } from "../../platform/lib/clock";
 // The ingest-refused policy has ONE home: `devices/metadata.ts`. This route
 // reads `INGEST_REFUSED` directly rather than keeping a parallel literal, so
 // the dormancy policy cannot drift between the two modules.
@@ -148,12 +149,6 @@ export interface DeviceNotIngestibleBody {
 // ---------------------------------------------------------------------------
 // Seams
 // ---------------------------------------------------------------------------
-
-/**
- * Clock seam. Returns Unix epoch milliseconds. Tests pass a fixed function so
- * the recorded timestamp is exactly knowable.
- */
-export type Clock = () => number;
 
 /**
  * Verifies a presented plaintext token and resolves it to the credential's
@@ -292,7 +287,28 @@ export interface TelemetryDeps {
    * {@link DEFAULT_DEVICE_KEY} so an anonymous sender is still attributable.
    */
   readonly defaultDevice?: string;
+  /**
+   * Optional anomaly observer: called once per persisted metric (with its
+   * server timestamp) AFTER the sink write, so the anomaly detector sees the
+   * same readings the store does. A `null` value is a state-only reading and is
+   * not observed. Best-effort: an observer that throws never fails the ingest —
+   * detection is a projection of the stream, not a precondition for it.
+   */
+  readonly anomaly?: AnomalyObserver;
 }
+
+/**
+ * Sees every accepted metric as it is persisted. `projectId` scopes the
+ * observation to a tenant; `key`/`value` are the validated metric; `ts` is the
+ * server timestamp. Synchronous and side-effect-only: it returns nothing and
+ * its failure is swallowed by the ingest route.
+ */
+export type AnomalyObserver = (
+  projectId: string,
+  key: string,
+  value: number,
+  ts: number,
+) => void;
 
 // ---------------------------------------------------------------------------
 // Constants & helpers
@@ -310,9 +326,6 @@ export const DEFAULT_DEVICE_KEY = "unknown";
  * (metric keys themselves are bounded by the shared module's `keyPattern`).
  */
 export const MAX_DEVICE_KEY_LENGTH = 128;
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock: Clock = () => Date.now();
 
 /**
  * Default rate-limit policy when a {@link IngestRateLimiter} is injected but no
@@ -592,6 +605,16 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
     const data: ValidTelemetry = result.data;
     for (const metric of data.metrics) {
       await deps.sink.record(projectId, device, metric.key, metric.value, ts);
+      // 7a. OBSERVE — feed the anomaly detector the SAME reading, after it is
+      //     durably recorded. A state-only metric (null value) is not observed;
+      //     a detector error is swallowed so detection can never fail an ingest.
+      if (deps.anomaly !== undefined && metric.value !== null) {
+        try {
+          deps.anomaly(projectId, metric.key, metric.value, ts);
+        } catch {
+          // Detection is a projection of the stream — never its precondition.
+        }
+      }
     }
 
     return c.body(null, 204);

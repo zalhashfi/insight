@@ -64,6 +64,7 @@
 
 import type { Context } from "hono";
 import { Hono } from "hono";
+import { defaultClock, type Clock } from "../../platform/lib/clock";
 import {
   readBearerToken,
   requireScope,
@@ -132,9 +133,6 @@ export interface QueryDeps {
   readonly now?: Clock;
 }
 
-/** A clock returning Unix epoch milliseconds. */
-export type Clock = () => number;
-
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -154,9 +152,6 @@ export const MAX_WINDOW_MS = 30 * 24 * 60 * 60 * 1000;
 
 /** Default window when the query string omits `window` (1 hour). */
 export const DEFAULT_WINDOW_MS = 60 * 60 * 1000;
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock: Clock = () => Date.now();
 
 // ---------------------------------------------------------------------------
 // Public response shapes

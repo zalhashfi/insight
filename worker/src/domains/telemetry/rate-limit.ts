@@ -67,19 +67,7 @@
  * needs them — an unused export is a promise this module does not keep.
  */
 
-// ---------------------------------------------------------------------------
-// Seams
-// ---------------------------------------------------------------------------
-
-/**
- * Clock seam. Returns Unix epoch milliseconds — the same shape as
- * `Clock` in `domains/telemetry/telemetry.ts`. Injected so every decision is
- * reproducible under test; the limiter never reads the wall clock directly.
- */
-export type Clock = () => number;
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock: Clock = () => Date.now();
+import { defaultClock, type Clock } from "../../platform/lib/clock";
 
 // ---------------------------------------------------------------------------
 // Contract constants (mirror test/contracts/contract-lock.ts)

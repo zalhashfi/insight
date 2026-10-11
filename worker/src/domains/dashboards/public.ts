@@ -83,6 +83,8 @@
  * is the filtering core they will stand on.
  */
 
+import { defaultClock, type Clock } from "../../platform/lib/clock";
+
 // ---------------------------------------------------------------------------
 // Layout & allow-list
 // ---------------------------------------------------------------------------
@@ -209,9 +211,6 @@ export type StreamFrame = Point;
 /** The hash function used to fold a plaintext share token to its digest. */
 export type TokenHasher = (plaintext: string) => Promise<string>;
 
-/** A clock returning Unix epoch milliseconds. */
-export type Clock = () => number;
-
 /** Construction options for {@link PublicDashboard}. */
 export interface PublicDashboardOptions {
   readonly shares: ShareResolver;
@@ -259,9 +258,6 @@ const defaultHasher: TokenHasher = async (plaintext) => {
   for (const byte of new Uint8Array(digest)) hex += byte.toString(16).padStart(2, "0");
   return hex;
 };
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock: Clock = () => Date.now();
 
 // ---------------------------------------------------------------------------
 // Errors

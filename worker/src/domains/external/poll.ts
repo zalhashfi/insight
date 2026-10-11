@@ -63,6 +63,8 @@
  * row never discards the good ones.
  */
 
+import { defaultClock } from "../../platform/lib/clock";
+
 // ---------------------------------------------------------------------------
 // Seams
 // ---------------------------------------------------------------------------
@@ -277,13 +279,6 @@ export interface PollResult {
   /** The watermark in force after this poll (unchanged on failure). */
   readonly cursor: string | null;
 }
-
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock = (): number => Date.now();
 
 // ---------------------------------------------------------------------------
 // Envelope path (`envelope_path`)

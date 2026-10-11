@@ -54,6 +54,7 @@
  */
 
 import { generateToken, hashToken } from "../../platform/lib/tokens";
+import { defaultClock, type Clock } from "../../platform/lib/clock";
 import type { Role } from "../projects/membership";
 
 // ---------------------------------------------------------------------------
@@ -260,12 +261,6 @@ export interface AcceptedInvite {
   /** The user who received the membership. */
   readonly userId: string;
 }
-
-/** Clock seam so tests can make timestamps deterministic. */
-export type Clock = () => number;
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock: Clock = () => Date.now();
 
 /** Id seam so tests can make ids deterministic; defaults to a random hex id. */
 export type IdFactory = () => string;

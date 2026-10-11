@@ -164,10 +164,10 @@ import { listProviders } from "./shared/integrations/index";
 import {
   AnomalyEngine,
   type AnomalyDetector,
-  type Clock,
   type EmitAnomaly,
   type SeriesReader,
 } from "./domains/analytics/anomaly";
+import type { Clock } from "./platform/lib/clock";
 import {
   pollSource,
   type ExternalSourceConfig,
@@ -579,10 +579,24 @@ export function createApp(deps: AppDeps): App {
   //    token is `403`). Authenticating and authorizing stay with the module
   //    that owns the wire contract.
   const resolveIngestDevice = deps.deviceTokens;
+  const anomalyGroup = deps.m4?.anomaly;
   app.route(
     "/v1/telemetry",
     createTelemetryIngest({
       ...deps.ingest,
+      // The anomaly detector is fed the stream it exists to watch: every accepted
+      // metric drives `AnomalyEngine.observe`, which emits through the `notify`
+      // seam wired in `mountM4`. The engine is resolved LAZILY (at request time)
+      // from the sidecar the app holds, so telemetry can mount before `mountM4`
+      // builds it without an ordering coupling. Absent the m4 anomaly group, no
+      // observer is installed and ingest is byte-for-byte unchanged.
+      ...(anomalyGroup !== undefined
+        ? {
+            anomaly: (_projectId, key, value) => {
+              anomalyEngines(app).get(anomalyGroup)?.observe(key, value);
+            },
+          }
+        : {}),
       // A rate limiter is always in force: the caller may inject one, otherwise
       // the process-wide default (one shared sliding-window log) is used. The
       // route keys it by the presented token and applies `rateLimit` (or the

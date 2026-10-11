@@ -66,6 +66,7 @@ import {
   type Principal,
 } from "../../platform/middleware/resolve-project";
 import type { AutomationEngine, Rule, RunReport } from "./run";
+import { defaultClock } from "../lib/clock";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -84,9 +85,6 @@ export const RUN_PERMISSION = "project:update" as const;
  * on one contract instead of spelling `"principal"` inline.
  */
 export const PRINCIPAL_CONTEXT_KEY = "principal";
-
-/** The default clock: Unix epoch milliseconds. */
-const defaultClock = (): number => Date.now();
 
 // ---------------------------------------------------------------------------
 // Seams

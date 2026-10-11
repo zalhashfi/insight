@@ -69,6 +69,8 @@
  * input always yields the same verdict and the same event.
  */
 
+import { defaultClock, type Clock } from "../../platform/lib/clock";
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -109,12 +111,6 @@ export type AnomalyReason =
 // ---------------------------------------------------------------------------
 // Seams
 // ---------------------------------------------------------------------------
-
-/** A clock returning Unix epoch milliseconds. */
-export type Clock = () => number;
-
-/** Default wall clock: Unix epoch milliseconds. */
-const defaultClock: Clock = () => Date.now();
 
 /**
  * Read seam. Returns the variable's samples over an inclusive `[from, to]`

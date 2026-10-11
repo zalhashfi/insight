@@ -69,6 +69,7 @@ import {
   shardStatements,
 } from "./shard-schema";
 import { dedupKey } from "../../domains/telemetry/dedup";
+import type { Clock } from "../lib/clock";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -83,9 +84,6 @@ const STREAM_SEPARATOR = "\u0000";
 // ---------------------------------------------------------------------------
 // Seams
 // ---------------------------------------------------------------------------
-
-/** A clock returning Unix epoch milliseconds. */
-export type Clock = () => number;
 
 /** One sample, in the shape both stores persist. */
 export interface Sample {

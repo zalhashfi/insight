@@ -56,6 +56,7 @@ import {
   decideOtaQuota,
   type OtaQuotaRow,
 } from "../quota/ota-quota";
+import type { Clock } from "../lib/clock";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -70,9 +71,6 @@ export const OTA_WINDOW_MS = OTA_QUOTA_WINDOW_MS;
 // ---------------------------------------------------------------------------
 // Seams
 // ---------------------------------------------------------------------------
-
-/** A clock returning Unix epoch milliseconds. */
-export type Clock = () => number;
 
 /** One queued command, in the shape both stores persist. */
 export interface PendingControl {
