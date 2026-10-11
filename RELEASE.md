@@ -57,6 +57,33 @@ An SPDX OR-expression (`MIT OR Apache-2.0`) passes when at least one branch is o
 the list; a copyleft term with no permissive alternative (`GPL-3.0-or-later`)
 fails.
 
+**Unclassifiable dependencies fail the audit.** A package whose licence cannot be
+read from any local source is `unclassified`, and `unclassified` is red — there
+is no silent pass. The single, narrow escape hatch is the reviewed
+`UNCLASSIFIED_ALLOW_LIST` in `test/release/lock-model.ts`: a frozen list of
+`{ name, reason }` entries, each naming the package **and** the reason it is
+accepted (and what would remove it). At 1.0 that list holds exactly two names —
+`@emnapi/runtime` (MIT) and `tslib` (0BSD) — both *dev-only* tooling of
+`insight-internal` whose `node_modules` is not installed in this checkout.
+
+The exemption is bounded by three rules, all machine-checked:
+
+1. **Dev-only, sibling-only.** A production dependency — in any repo — and
+   *anything at all* in `insight`'s own closure is never exempt, even if its name
+   is on the list. `insight` resolves 100% of its closure locally and the suite
+   asserts its review set is empty.
+2. **Name + reason, always.** An entry with no reason is a silenced failure:
+   `validateAllowList` rejects it and the suite is red. An *unnamed* unclassifiable
+   row fails outright.
+3. **Exact-name membership.** The list never grows implicitly: a new dependency,
+   or one whose licence becomes resolvable, is a new row that re-opens the audit.
+
+Inheritance (rule 2 above) is **transitive**: a per-platform binary inherits from
+its parent, and its parent from *its* parent, up the chain
+(`sharp` → `@img/sharp-linux-x64` → `@img/sharp-libvips-linux-x64`). This is what
+resolves the six `@img/sharp-libvips-*` binaries deterministically instead of
+leaving them unclassified.
+
 ### 2.2 Portability audit — NFR-CMP-02/03, NFR-LEG-01/02/03
 
 Three assertions:
@@ -97,8 +124,8 @@ bun run typecheck
 Expected (at the 1.0 candidate, as measured):
 
 ```
-bun test test/release/...   →  20 pass / 0 fail
-bun test                    →  1307 pass / 0 fail across 64 files
+bun test test/release/...   →  21 pass / 0 fail
+bun test                    →  1308 pass / 0 fail across 64 files
 bun run typecheck           →  exit 0
 ```
 
@@ -107,7 +134,12 @@ bun run typecheck           →  exit 0
 * Licence audit — insight closure: **94 packages, 94 classified, 0 non-permissive,
   0 unclassified.** The one production dependency is `hono` (MIT); the rest are
   the dev toolchain and their transitive trees (88 MIT, 2 Apache-2.0, 2 ISC,
-  1 BSD-3-Clause, 1 `MIT OR Apache-2.0`).
+  1 BSD-3-Clause, 1 `MIT OR Apache-2.0`). `insight` uses the allow-list **zero**
+  times.
+* Licence audit — allow-list: exactly **2** reviewed entries, both dev-only
+  `insight-internal` tooling (`@emnapi/runtime` MIT, `tslib` 0BSD); every entry
+  carries a reason (`validateAllowList` asserts it). The six `@img/sharp-libvips-*`
+  binaries are classified by inheritance, not exempted.
 * Clean-room — `grep -ri <reference-name>` across all five repos' tracked files:
   **0**. Each `LICENSE`: `Copyright (c) 2026 zalhashfi`, sole holder.
 * Credential scan — all five repos' shipped source scanned, **0 findings**; a
@@ -117,15 +149,17 @@ bun run typecheck           →  exit 0
 ## 4. Known limitations (recorded, not hidden)
 
 * **Offline licence resolution is bounded by what is installed.** In this
-  checkout the `insight-internal/collector` dev tree is only partially installed,
-  so **8 dev-only** tooling packages there have no local `package.json` to read:
-  `@emnapi/runtime`, `tslib`, and six `@img/sharp-libvips-*` binaries for other
-  platforms (linux arm/arm64/s390x/x64 and the musl variants). The audit
-  **reports these explicitly** in its output (an `advisory:` line naming each
-  one) and exempts them from the "unclassified fails" rule **only** when they
-  are dev-only tooling of a sibling repo. Every production dependency of every
-  repo is always classified, and no copyleft term is ever exempt. A full
-  `bun install` in each sibling repo clears the advisory list.
+  checkout the `insight-internal/collector` dev tree is not installed, so two
+  dev-only tooling packages there declare no local licence and stay
+  `unclassified`: `@emnapi/runtime` and `tslib` (both reached through the
+  `wrangler` → `sharp` → `@img/sharp-wasm32` chain). They do **not** pass
+  silently: they are the only two entries on the reviewed
+  `UNCLASSIFIED_ALLOW_LIST`, each with a reason, and each is dev-only sibling
+  tooling — a production or `insight` row of the same name still fails. The six
+  `@img/sharp-libvips-*` binaries that were previously advisory are now classified
+  by transitive platform-binary inheritance, not exempted. A full
+  `bun install` in `insight-internal/collector` makes both removable from the
+  list (the reason field says so).
 * **Reference-name guard scope.** The clean-room guard scans tracked text files
   (source + documentation `.md`/`.txt`/`.rst`); a reference name embedded in a
   binary asset or an extension-less file would not be caught textually. No such

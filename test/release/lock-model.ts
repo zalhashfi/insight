@@ -344,6 +344,43 @@ export function resolveLicenses(
   lookup: LicenseLookup,
 ): readonly LicensedDependency[] {
   const resolved: LicensedDependency[] = [];
+  const byName = new Map(graph.nodes.map((node) => [node.name, node] as const));
+
+  /** The lock element (metadata) of a package by name. */
+  const elementOf = (name: string): LockElement | undefined => {
+    const key = lockKeyOf(lock, name);
+    return key === null ? undefined : lock.packages?.[key]?.[2];
+  };
+
+  /**
+   * Resolve the licence a per-platform binary inherits, by walking **up** the
+   * `via` chain through consecutive platform binaries until a package with its
+   * own licence field is reached.
+   *
+   * The chain is not one hop deep: `sharp` → `@img/sharp-linux-x64` →
+   * `@img/sharp-libvips-linux-x64` is three levels, and `sharp` → `@img/sharp-wasm32`
+   * → `@emnapi/runtime` → `tslib` is four. Every hop is still the same project's
+   * per-platform artefact, so the licence is the root project's — recorded, not
+   * guessed. Returns the root expression plus the first ancestor that owned it,
+   * or `null` when the chain bottoms out without a local source (fail-closed).
+   */
+  const inheritedExpression = (
+    node: GraphNode,
+  ): { readonly expression: string; readonly from: string } | null => {
+    let current = node;
+    // Bound the walk by the node count so a cyclic `via` chain cannot spin.
+    for (let hop = 0; hop < byName.size; hop += 1) {
+      if (!isPlatformBinary(elementOf(current.name))) return null;
+      const parentName = current.via;
+      if (parentName === null) return null;
+      const parentOwn = lookup.declared(parentName);
+      if (parentOwn !== null) return { expression: parentOwn, from: parentName };
+      const grandparent = byName.get(parentName);
+      if (grandparent === undefined) return null;
+      current = grandparent;
+    }
+    return null;
+  };
 
   for (const node of graph.nodes) {
     const own = lookup.declared(node.name);
@@ -358,23 +395,15 @@ export function resolveLicenses(
       continue;
     }
 
-    const key = lockKeyOf(lock, node.name);
-    const element = key === null ? undefined : lock.packages?.[key]?.[2];
-    const parentExpression =
-      node.via !== null && isPlatformBinary(element)
-        ? node.viaLockKey !== null
-          ? lookup.declaredByLockKey(node.viaLockKey)
-          : lookup.declared(node.via)
-        : null;
-
-    if (parentExpression !== null && parentExpression !== undefined) {
+    const inherited = inheritedExpression(node);
+    if (inherited !== null) {
       resolved.push({
         name: node.name,
         kind: node.kind,
-        expression: parentExpression,
+        expression: inherited.expression,
         source: "inherited-from-parent",
-        inheritedFrom: node.via ?? undefined,
-        verdict: classify(parentExpression),
+        inheritedFrom: inherited.from,
+        verdict: classify(inherited.expression),
       });
       continue;
     }
@@ -394,6 +423,119 @@ export function resolveLicenses(
 /** The subset of resolved dependencies the operator must look at: anything not permissive. */
 export function offending(dependencies: readonly LicensedDependency[]): readonly LicensedDependency[] {
   return dependencies.filter((dependency) => dependency.verdict.kind !== "permissive");
+}
+
+// ---------------------------------------------------------------------------
+// The reviewed unclassified allow-list — the ONLY way an unresolved row passes
+// ---------------------------------------------------------------------------
+
+/**
+ * One reviewed exemption: a dependency whose licence could not be read from any
+ * local source, together with the human reason it is nonetheless accepted.
+ *
+ * Both fields are required. A name with no reason is not a review, it is a
+ * silenced failure — {@link validateAllowList} rejects it.
+ */
+export interface UnclassifiedAllowListEntry {
+  /** The package name exactly as it appears in the lockfile closure. */
+  readonly name: string;
+  /** Why this row is accepted, and what would remove it from the list. */
+  readonly reason: string;
+}
+
+/**
+ * The reviewed allow-list of dependencies that ship **unclassifiable**.
+ *
+ * This is the deliberate, auditable replacement for a silent pass: a row whose
+ * licence cannot be resolved offline fails the audit *unless* its name appears
+ * here with a reason. Two rules the audit enforces on top of membership:
+ *
+ *   * **Only a sibling repo's dev-only tooling may be listed.** A production
+ *     dependency, or anything in `insight`'s own closure, is never exempt — an
+ *     unknown or copyleft dev dep in *our* tree fails outright.
+ *   * **Membership is by exact name.** An added dependency, or a licence that
+ *     becomes resolvable/incompatible, is a new row and re-opens the audit; the
+ *     list never grows implicitly.
+ *
+ * Each entry records the upstream licence that *would* be read once the package
+ * is installed — the reason names it so a reviewer can re-check, and says what
+ * makes the entry removable.
+ */
+export const UNCLASSIFIED_ALLOW_LIST: readonly UnclassifiedAllowListEntry[] = Object.freeze([
+  {
+    name: "@emnapi/runtime",
+    reason:
+      "insight-internal dev tooling; transitive dependency of @img/sharp-wasm32 (a wrangler " +
+      "optional binary). Its node_modules is not installed in this checkout, so no local source " +
+      "declares a licence. Upstream declares MIT. Remove once `bun install` in " +
+      "insight-internal/collector makes the row resolvable.",
+  },
+  {
+    name: "tslib",
+    reason:
+      "insight-internal dev tooling; transitive dependency of @emnapi/runtime. Its node_modules is " +
+      "not installed in this checkout, so no local source declares a licence. Upstream declares " +
+      "0BSD. Remove once `bun install` in insight-internal/collector makes the row resolvable.",
+  },
+]);
+
+/** The outcome of reviewing a repo's unclassified rows against the allow-list. */
+export interface UnclassifiedReview {
+  /** Rows accepted only because they are on the allow-list (name + reason). */
+  readonly accepted: readonly LicensedDependency[];
+  /** Rows the audit must fail on: not listed, listed without a reason, or not dev-only-sibling. */
+  readonly mustFail: readonly LicensedDependency[];
+}
+
+/**
+ * Review every unclassified row of one repo against {@link UNCLASSIFIED_ALLOW_LIST}.
+ *
+ * A row is `accepted` **iff** it is a *development* dependency, in a repo other
+ * than `insight`, and its name is on the allow-list. Every
+ * other unclassified row is `mustFail` — including a listed name that appears as
+ * a production dependency, and anything in `insight` itself. This is the rule
+ * that turns "unclassified passes silently" into "unclassified fails unless a
+ * human wrote down a reason".
+ */
+export function reviewUnclassified(
+  dependencies: readonly LicensedDependency[],
+  options: { readonly repo: string; readonly allowList?: readonly UnclassifiedAllowListEntry[] },
+): UnclassifiedReview {
+  const allowList = options.allowList ?? UNCLASSIFIED_ALLOW_LIST;
+  const listed = new Set(allowList.map((entry) => entry.name));
+  const accepted: LicensedDependency[] = [];
+  const mustFail: LicensedDependency[] = [];
+
+  for (const dependency of dependencies) {
+    if (dependency.verdict.kind !== "unclassified") continue;
+    const exemptable = dependency.kind === "development" && options.repo !== "insight";
+    if (exemptable && listed.has(dependency.name)) accepted.push(dependency);
+    else mustFail.push(dependency);
+  }
+
+  return { accepted, mustFail };
+}
+
+/**
+ * Validate the shape of an allow-list: every entry names a package and gives a
+ * non-empty reason, and no name is repeated.
+ *
+ * Returns the list of human-readable problems (empty when the list is sound).
+ * The suite asserts this is empty, so an entry can never be added as a bare name
+ * (a silenced failure) or a duplicated row.
+ */
+export function validateAllowList(
+  allowList: readonly UnclassifiedAllowListEntry[],
+): readonly string[] {
+  const problems: string[] = [];
+  const seen = new Set<string>();
+  for (const entry of allowList) {
+    if (entry.name.trim().length === 0) problems.push("allow-list entry with an empty name");
+    if (entry.reason.trim().length === 0) problems.push(`allow-list entry "${entry.name}" has no reason`);
+    if (seen.has(entry.name)) problems.push(`allow-list entry "${entry.name}" is duplicated`);
+    seen.add(entry.name);
+  }
+  return problems;
 }
 
 /** A human-readable, deterministic one-line-per-dependency report. */

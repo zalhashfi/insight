@@ -26,10 +26,12 @@
  *     pure resolver in `./lock-model.ts` returns `unclassified` for an absent or
  *     unrecognised expression; the assertions below turn any non-permissive
  *     verdict — copyleft *or* unclassified — into a red test that names the row.
- *     Where a *sibling* repo's dev-only tooling genuinely cannot be resolved
- *     offline (its `node_modules` is not installed in this checkout), the test
- *     reports exactly which packages those are rather than claiming a green it
- *     cannot support — see the annotation in the sibling describe block.
+ *     The *only* way an unclassified row passes is by appearing, by exact name
+ *     **and with a reason**, on the reviewed `UNCLASSIFIED_ALLOW_LIST` in
+ *     `./lock-model.ts` — and that exemption is available to a sibling repo's
+ *     DEV-ONLY tooling alone. Production dependencies and this repo's own
+ *     closure are never exempt. An unnamed unclassifiable dependency, or a
+ *     listed name that turns out to be a production dependency, fails the audit.
  *
  * The allowed set is the documented allow-list in `./lock-model.ts` (MIT,
  * Apache-2.0, BSD-2/3-Clause, ISC, 0BSD, CC0-1.0, Unlicense). An SPDX
@@ -47,6 +49,7 @@ import { describe, expect, it } from "vitest";
 import {
   DISALLOWED_LICENSES,
   PERMISSIVE_LICENSES,
+  UNCLASSIFIED_ALLOW_LIST,
   classify,
   dependencyGraph,
   licenseReport,
@@ -54,6 +57,8 @@ import {
   offending,
   packageNameOf,
   resolveLicenses,
+  reviewUnclassified,
+  validateAllowList,
   type DependencyGraph,
   type LicensedDependency,
   type LicenseLookup,
@@ -282,6 +287,12 @@ describe("license audit — every dependency this release ships is permissive (N
     const unresolved = dependencies.filter((d) => d.verdict.kind === "unclassified");
     expect(unresolved, "unclassified dependencies:\n" + failureLines(dependencies)).toEqual([]);
 
+    // Fail-closed in this repo's own closure: `insight` never relies on the
+    // reviewed allow-list. Even a listed name here would fail the review.
+    const review = reviewUnclassified(dependencies, { repo: "insight" });
+    expect(review.accepted, "insight must not use the allow-list").toEqual([]);
+    expect(review.mustFail, "insight must not have unclassified deps").toEqual([]);
+
     // And every one of them is permissive.
     expect(offending(dependencies), "non-permissive dependencies:\n" + failureLines(dependencies)).toEqual([]);
 
@@ -374,26 +385,29 @@ describe("license audit — the sibling component repos (NFR-LEG-04 across the r
       const copyleft = bad.filter((d) => d.verdict.kind === "copyleft");
       expect(copyleft, `non-permissive dependencies:\n${failureLines(dependencies)}`).toEqual([]);
 
-      // An *unclassified* row is red too — unless it is a DEV-ONLY dependency of
-      // a sibling repo whose full tree is not installed in this checkout. Those
-      // rows carry no local licence source *on this machine* (their `node_modules`
-      // is absent), so "green" cannot be claimed for them honestly: they are
-      // reported, in the failure message, as dependencies this audit could NOT
-      // classify offline. Production deps and this repo's dev deps are never
-      // exempt — they always resolve, and this suite proves that above.
-      const unclassified = bad.filter((d) => d.verdict.kind === "unclassified");
-      const advisory = unclassified.filter(
-        (d) => d.kind === "development" && repo !== "insight",
-      );
-      const mustFail = unclassified.filter((d) => !(d.kind === "development" && repo !== "insight"));
+      // An *unclassified* row is red too, unless it is explicitly reviewed. The
+      // review is `UNCLASSIFIED_ALLOW_LIST` — a name **and a reason** per entry,
+      // in `lock-model.ts`. There is no blanket exemption here: an unclassifiable
+      // dependency that nobody wrote down fails the audit, which is exactly how
+      // an unknown/copyleft dev dep is stopped from slipping through. Only a
+      // sibling repo's DEV-ONLY tooling may be listed; production and this
+      // repo's own closure never are.
+      const { accepted, mustFail } = reviewUnclassified(dependencies, { repo });
 
-      expect(unclassified.length, `unclassified dependencies:\n${failureLines(dependencies)}`).toBe(
-        advisory.length,
-      );
       expect(
         mustFail,
-        `unclassified dependencies that are not dev-only sibling tooling:\n${failureLines(dependencies)}`,
+        `unclassified dependencies that are not on the reviewed allow-list ` +
+          `(add a name+reason to UNCLASSIFIED_ALLOW_LIST, or make them resolvable):\n` +
+          failureLines(mustFail),
       ).toEqual([]);
+
+      // The accepted rows are named, with their reason, rather than hidden: an
+      // operator reading the run sees exactly what could not be classified
+      // offline and why each one is still allowed.
+      for (const d of accepted) {
+        const reason = UNCLASSIFIED_ALLOW_LIST.find((entry) => entry.name === d.name)?.reason ?? "";
+        console.info(`license-audit accepted (allow-listed): ${repo} ${d.name} (${d.kind}) — ${reason}`);
+      }
 
       // And every PRODUCTION dependency of every repo is classified permissive.
       // (A repo may ship zero runtime dependencies — `insight-agent` declares
@@ -401,20 +415,38 @@ describe("license audit — the sibling component repos (NFR-LEG-04 across the r
       const production = dependencies.filter((d) => d.kind === "production");
       expect(offending(production), `non-permissive production deps:\n${failureLines(production)}`).toEqual([]);
 
+      // Fail-closed proof: the allow-list can never exempt a production row or
+      // anything in `insight`, and the review treats an *unlisted* name as a
+      // failure. These assertions make the escape hatch load-bearing rather than
+      // vacuous (the previous revision compared a filtered set to itself).
+      expect(reviewUnclassified(production, { repo }).accepted).toEqual([]);
+      expect(
+        reviewUnclassified(
+          [{ name: "mystery-lib", kind: "development", expression: null, source: "unresolved", verdict: classify(null) }],
+          { repo },
+        ).mustFail.map((d) => d.name),
+      ).toEqual(["mystery-lib"]);
+      expect(
+        reviewUnclassified(
+          [{ name: "@emnapi/runtime", kind: "production", expression: null, source: "unresolved", verdict: classify(null) }],
+          { repo },
+        ).mustFail.map((d) => d.name),
+      ).toEqual(["@emnapi/runtime"]);
+
       // The graph is never empty and always contains real dependencies.
       expect(graph.nodes.length).toBeGreaterThan(0);
-
-      // Report the advisory set so the operator can see exactly what could not
-      // be classified offline (the ticket requires naming them, not hiding them).
-      if (advisory.length > 0) {
-        console.info(
-          `license-audit advisory: ${repo} has ${advisory.length} dev-only dependency(ies) whose ` +
-            `licence is not locally resolvable (its node_modules is not installed here): ` +
-            advisory.map((d) => d.name).join(", "),
-        );
-      }
     });
   }
+
+  it("the unclassified allow-list is well-formed: every entry names a package and gives a reason", () => {
+    // A bare name (no reason) is a silenced failure, not a review. This is the
+    // guard that keeps the escape hatch auditable.
+    expect(validateAllowList(UNCLASSIFIED_ALLOW_LIST)).toEqual([]);
+    for (const entry of UNCLASSIFIED_ALLOW_LIST) {
+      expect(entry.name.length, "an allow-list entry must name a package").toBeGreaterThan(0);
+      expect(entry.reason.trim().length, `${entry.name} must carry a reason`).toBeGreaterThan(0);
+    }
+  });
 
   it("insight-llm declares no runtime dependency (Python) and insight-sdk none (PlatformIO)", () => {
     // A dependency added here must re-open this audit, so assert the current
