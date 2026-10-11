@@ -22,8 +22,10 @@
  *      discrete event to `POST /v1/events`; the background dispatcher runs the
  *      REAL `AutomationEngine` over a projection whose `temp` is above the
  *      threshold, and the engine's `set_variable` action is recorded. The
- *      threshold is asserted two-sided: below it, nothing is written.
- *      (FR-AUT-01/02/03/04)
+ *      threshold is asserted two-sided: below it, nothing is written. The same
+ *      dispatcher is the REAL `createCascadeDispatcher`, so an `emit_event`
+ *      action's child event is dispatched as a further run — the cascade, wired
+ *      and bounded by the depth cap. (FR-AUT-01/02/03/04)
  *
  *   3. **OTA offer → image serves the frozen shape.** A stale device's
  *      `GET /v1/ota` returns `{update:{version,size,sha256,url}}`; the
@@ -52,6 +54,7 @@ import {
   type WebSocketLike,
   type WebSocketRuntime,
 } from "../../worker/src/domains/telemetry/control-ws";
+import { createCascadeDispatcher } from "../../worker/src/platform/engine/cascade";
 import {
   AutomationEngine,
   InMemoryProjection,
@@ -283,10 +286,13 @@ function harness(): Harness {
       control: { plane: control, verifyToken: verifyDevice, ws: sockets.runtime },
       events: {
         verifyToken: async (token, _c) => (token === TOKEN ? DEVICE_PRINCIPAL : null),
-        dispatch: async (trigger) => {
-          const rules = rulesByEvent.get(trigger.event ?? "") ?? [];
-          if (rules.length > 0) await engine.run(rules, trigger);
-        },
+        // The REAL cascade dispatcher (A21): an emitted event re-enters the
+        // engine as a child run, bounded by the depth cap — so this file proves
+        // the wired path, not a one-hop stand-in.
+        dispatch: createCascadeDispatcher({
+          engine,
+          rulesForEvent: (event) => rulesByEvent.get(event) ?? [],
+        }),
       },
       ota: {
         offer: {
@@ -558,6 +564,42 @@ describe("M3 e2e — automation temp > 30 → set_variable", () => {
     });
     expect(res.status).toBe(STATUS.noContent);
     expect(h.executor.writes).toEqual([]);
+  });
+
+  it("dispatches an emitted event as a CHILD run (the cascade is wired)", async () => {
+    const h = harness();
+    // `door` wakes a rule that emits `alarm` (a fresh id); the cascade must
+    // then run whatever rule `alarm` selects — proving `emittedEvents` is
+    // consumed through the wired dispatcher, not dropped.
+    h.addAutomation(
+      {
+        id: "aut_door",
+        cooldownMs: 0,
+        conditions: [],
+        actions: [{ type: "emit_event", event: "alarm", eventId: "evt_door_alarm", payload: {} }],
+      },
+      "door",
+    );
+    h.addAutomation(
+      {
+        id: "aut_alarm",
+        cooldownMs: 0,
+        conditions: [],
+        actions: [{ type: "set_variable", key: "siren", value: 1 }],
+      },
+      "alarm",
+    );
+
+    const res = await h.app.request("/v1/events", {
+      method: "POST",
+      headers: { ...BEARER, "content-type": "application/json" },
+      body: JSON.stringify({ event: "door", payload: {} }),
+    });
+    expect(res.status).toBe(STATUS.noContent);
+
+    // The child run's consequence is observable: `siren` was set by `alarm`.
+    const write = h.executor.writes.find((w) => w.kind === "set_variable");
+    expect(write?.detail).toMatchObject({ key: "siren", value: 1 });
   });
 });
 

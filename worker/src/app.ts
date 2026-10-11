@@ -26,7 +26,9 @@
  *   | `GET  /v1/control` + `/ack` + `/ws` | {@link AppDeps.m3}.control   |
  *   | `POST /v1/events`                | {@link AppDeps.m3}.events       |
  *   | `POST /v1/admin/projects/:proj/automations/:id/run` | {@link AppDeps.m3}.manualRun |
- *   | `GET  /v1/public/dashboards/:token` | {@link AppDeps.m3}.publicDashboard |
+ *   | `DELETE /v1/admin/projects/:proj`       | {@link AppDeps.m3}.projectDelete |
+ *   | `POST /v1/admin/projects/:proj/firmware`| {@link AppDeps.m3}.firmwareUpload |
+ *   | `GET  /v1/public/dashboards/:token` (+ `/stream`) | {@link AppDeps.m3}.publicDashboard |
  *
  * ## Dependencies are injected, never faked
  *
@@ -118,6 +120,14 @@ import {
   createManualRun,
   type ManualRunDeps,
 } from "./platform/engine/manual-run";
+import {
+  createFirmwareUploadRoute,
+  type FirmwareUploadRouteDeps,
+} from "./domains/firmware/upload-route";
+import {
+  createProjectDeleteRoute,
+  type ProjectDeleteRouteDeps,
+} from "./domains/projects/delete-route";
 import {
   PublicDashboardService,
   isPublicDashboardError,
@@ -260,9 +270,30 @@ export interface AppDeps {
       readonly credentials: CredentialLookup;
     };
     /**
-     * `GET /v1/public/dashboards/:token` — the allow-list-filtered public read.
-     * A share token is resolved by {@link PublicDashboardService}; the response
-     * never carries a variable outside the layout the share names.
+     * `DELETE /v1/admin/projects/:proj` — the owner-only project delete.
+     * Mounted on the `/v1/admin/projects` subtree behind
+     * {@link resolveAdminProject}; the handler additionally enforces the
+     * owner-only `project:delete` capability through the membership table.
+     */
+    readonly projectDelete?: {
+      readonly deps: ProjectDeleteRouteDeps;
+      readonly credentials: CredentialLookup;
+    };
+    /**
+     * `POST /v1/admin/projects/:proj/firmware` — the admin OTA upload. Mounted
+     * on the `/v1/admin/projects` subtree behind {@link resolveAdminProject};
+     * the handler additionally enforces `project:update` (admin+) through the
+     * membership table, and the service's own `413` for an oversize body.
+     */
+    readonly firmwareUpload?: {
+      readonly deps: FirmwareUploadRouteDeps;
+      readonly credentials: CredentialLookup;
+    };
+    /**
+     * `GET /v1/public/dashboards/:token` and `.../stream` — the
+     * allow-list-filtered public read and its live stream. A share token is
+     * resolved by {@link PublicDashboardService}; neither response ever carries
+     * a variable outside the layout the share names.
      */
     readonly publicDashboard?: PublicDashboardOptions;
   };
@@ -401,7 +432,10 @@ export function createApp(deps: AppDeps): App {
  *   * `GET  /v1/control/ws`                   — socket transport (same seam)
  *   * `POST /v1/events`                       — discrete event (device bearer)
  *   * `POST /v1/admin/projects/:proj/automations/:id/run` — behind the admin gate
+ *   * `DELETE /v1/admin/projects/:proj`       — owner-only project delete
+ *   * `POST /v1/admin/projects/:proj/firmware` — admin OTA upload (413 >8 MiB)
  *   * `GET  /v1/public/dashboards/:token`     — allow-list-filtered public read
+ *   * `GET  /v1/public/dashboards/:token/stream` — allow-list-filtered live stream
  */
 function mountM3(app: App, deps: AppDeps): void {
   const m3 = deps.m3;
@@ -463,6 +497,35 @@ function mountM3(app: App, deps: AppDeps): void {
     app.route("/v1/admin/projects", admin);
   }
 
+  // --- Admin project delete (A23) ------------------------------------------
+  // Owner-only. The shared session gate pins the principal and matches `:proj`,
+  // then the handler enforces `project:delete` (owner) through the membership
+  // table. The delete is the idempotent, resumable entry, so a rerun leaves no
+  // orphan.
+  if (m3.projectDelete !== undefined) {
+    app.route(
+      "/v1/admin/projects",
+      createProjectDeleteRoute({
+        ...m3.projectDelete.deps,
+        credentials: m3.projectDelete.credentials,
+      }),
+    );
+  }
+
+  // --- Admin firmware upload (A18) -----------------------------------------
+  // Admin+. The shared session gate pins the principal and matches `:proj`,
+  // then the handler enforces `project:update` (admin+) before any bytes are
+  // read; the upload service's own `413` covers an oversize body.
+  if (m3.firmwareUpload !== undefined) {
+    app.route(
+      "/v1/admin/projects",
+      createFirmwareUploadRoute({
+        ...m3.firmwareUpload.deps,
+        credentials: m3.firmwareUpload.credentials,
+      }),
+    );
+  }
+
   // --- Public dashboard (A24) ----------------------------------------------
   // A share token in the path resolves to an allow-listed view; the snapshot is
   // the projection filtered by the layout the share names. A refusal is the
@@ -481,6 +544,55 @@ function mountM3(app: App, deps: AppDeps): void {
         }
         throw err;
       }
+    });
+
+    // The live stream (A24 / INV-D2): the SAME view's `subscribe`, whose frames
+    // are filtered through the SAME allow-list as the snapshot — so a variable
+    // outside the layout is dropped on the stream exactly as it is in the read.
+    // A share that cannot be resolved is the uniform 404 before any stream is
+    // opened, so an anonymous caller never gets a long-lived refused socket.
+    app.get("/v1/public/dashboards/:token/stream", async (c) => {
+      let view;
+      try {
+        view = await dashboard.resolve(c.req.param("token"));
+      } catch (err) {
+        if (isPublicDashboardError(err)) {
+          return c.json(err.toBody(), err.status as 401 | 404);
+        }
+        throw err;
+      }
+
+      const encoder = new TextEncoder();
+      let unsubscribe: (() => void) | null = null;
+      const stream = new ReadableStream<Uint8Array>({
+        async start(controller) {
+          const send = (data: unknown): void => {
+            controller.enqueue(encoder.encode(`data: ${JSON.stringify(data)}\n\n`));
+          };
+          // Announce the allow-list once, so a client knows what it may receive
+          // before the first frame arrives.
+          send({ variables: view.variables });
+          try {
+            unsubscribe = await view.subscribe((frame) => send(frame));
+          } catch {
+            // No frame seam (snapshot-only deploy): close cleanly after the
+            // allow-list rather than holding an empty stream open.
+            controller.close();
+          }
+        },
+        cancel() {
+          unsubscribe?.();
+        },
+      });
+
+      return new Response(stream, {
+        status: 200,
+        headers: {
+          "Content-Type": "text/event-stream; charset=utf-8",
+          "Cache-Control": "no-store",
+          Connection: "keep-alive",
+        },
+      });
     });
   }
 }
