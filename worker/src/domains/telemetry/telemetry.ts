@@ -4,8 +4,11 @@
  * This is the *ingest* half of A08; the pure validation half lives in
  * `validate-route.ts` + `shared/validation.ts` and is reused verbatim here.
  * Nothing about parsing, size/count gates or key/value rules is re-implemented
- * in this file: {@link readTelemetry} is the single entry point and the shared
- * module remains the single source of truth.
+ * in this file: validation is delegated to the shared `shared/validation.ts`
+ * module (via `checkSize` and `validateTelemetry`), which remains the single
+ * source of truth. `readTelemetry` in `validate-route.ts` is the equivalent
+ * single entry point for the *read* flow; this ingest route drives the shared
+ * primitives directly so it can stamp server time and persist per metric.
  *
  * What this route adds on top of validation
  * -----------------------------------------

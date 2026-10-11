@@ -1,6 +1,5 @@
 import { describe, expect, it } from "vitest";
 import {
-  DEVICE_TOKEN_VERIFY_IS_UNCACHED,
   InMemoryTokenRepo,
   createProjectToken,
   listProjectTokens,
@@ -89,10 +88,12 @@ class SessionCacheRepo extends InMemoryTokenRepo {
 }
 
 describe("INV-A3 — device token revoke is immediate (no cache)", () => {
-  it("the module declares its verification path uncached", () => {
-    expect(DEVICE_TOKEN_VERIFY_IS_UNCACHED).toBe(true);
-  });
-
+  // NB: a test asserting `DEVICE_TOKEN_VERIFY_IS_UNCACHED === true` would be
+  // tautological — the value is a `true as const` literal, so the assertion can
+  // never fail and proves nothing about behaviour. The load-bearing proof is
+  // the read-counter tests below: they drive a real repo and show a fresh store
+  // read on every verification, which is what actually makes revocation
+  // immediate.
   it("request #1 succeeds, revoke, request #2 is rejected with a FRESH read", async () => {
     const repo = new CountingTokenRepo();
     const { plaintext, record } = await createProjectToken(repo, {

@@ -177,9 +177,11 @@ export const DEVICE_TOKEN_VERIFY_IS_UNCACHED = true as const;
  * The single, uncached read step behind {@link verifyProjectToken}: hash the
  * plaintext and fetch the row it indexes, on EVERY call.
  *
- * Exported so a caller (or test) can invoke the raw lookup directly and prove
- * that `findByHash` is hit per call — there is no layer here to short-circuit a
- * second, third or Nth presentation of the same plaintext.
+ * This is a private module-internal helper — it is deliberately NOT exported,
+ * so no caller can bypass {@link verifyProjectToken}'s revoke/expiry checks by
+ * reaching the raw lookup directly. (A test wanting to prove the per-call
+ * `findByHash` hit does so through a counting `TokenRepo` — see
+ * `test/identity/revoke.test.ts` — not by importing this function.)
  */
 async function readTokenByPlaintext(
   repo: TokenRepo,
