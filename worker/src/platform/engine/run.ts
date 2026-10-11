@@ -53,8 +53,21 @@
  *      (up/down/up/down) therefore fires at most once per cooldown window
  *      instead of once per change (ST-U3 / INV-U3).
  *   3. **Event-id dedup.** An `emit_event` carries an id; a repeated id is
- *      delivered **once**. An at-least-once producer (a redelivered webhook, a
- *      device retry) cannot turn one logical event into two executions.
+ *      delivered **once per run**. An at-least-once producer (a redelivered
+ *      webhook, a device retry) cannot turn one logical event into two
+ *      executions.
+ *
+ * ## One run's state is its own
+ *
+ * The step budget and the event-id dedup set are allocated inside `run` and
+ * reach no other invocation, so two runs over one engine — a dispatcher that
+ * does not `await` a background run, say — each obey {@link MAX_STEPS}
+ * independently instead of resetting a shared counter under each other.
+ *
+ * The one exception, deliberately, is **cooldown**: `now - lastExecution <
+ * cooldownMs` is a cross-run property by definition (an oscillating variable
+ * must be throttled *between* runs, not within one), so it stays on the
+ * instance — bounded by {@link MAX_TRACKED_RULES}, evicting the stalest entry.
  *
  * ## Fail closed
  *
@@ -89,6 +102,17 @@ export const MAX_EVENT_DEPTH = 5;
 
 /** The default value-equality tolerance for `if_variable` (FR-AUT-03). */
 export const DEFAULT_VALUE_EPSILON = 1e-9;
+
+/**
+ * The ceiling on the engine's cross-run cooldown memory: the most distinct
+ * rule ids an instance tracks before it evicts the stalest entry. Kernel-
+ * resident and long-lived instances see a bounded, rotating set of automations
+ * (rules are `ProjectDO`-scoped, not per-engine), so without a cap the cooldown
+ * map would grow one entry per distinct rule id forever. Eviction only ever
+ * forgets a cooldown, so the worst it can do is *admit* a run early — it can
+ * never drop an event a caller is owed.
+ */
+export const MAX_TRACKED_RULES = 1024;
 
 // ---------------------------------------------------------------------------
 // Seams
@@ -358,6 +382,21 @@ export interface EmittedEvent {
   readonly depth: number;
 }
 
+/**
+ * The mutable state a single {@link AutomationEngine.run} call owns.
+ *
+ * It is allocated fresh in `run` and threaded down to the per-rule helpers, so
+ * it is never reachable from any other invocation: two runs in flight at once
+ * can neither read nor reset each other's {@link RunState.steps} budget or
+ * {@link RunState.emittedEventIds} dedup set.
+ */
+interface RunState {
+  /** Condition + action nodes consumed so far this run, against {@link MAX_STEPS}. */
+  steps: number;
+  /** Event ids this run has already emitted; the per-run dedup set. */
+  readonly emittedEventIds: Set<string>;
+}
+
 /** Left-closed, right-open window: `[start, end)`, wrapping when `end < start`. */
 function withinWindow(minute: number, startMinute: number, endMinute: number): boolean {
   if (startMinute <= endMinute) {
@@ -380,12 +419,18 @@ export class AutomationEngine {
   private readonly maxEventDepth: number;
   private readonly valueEpsilon: number;
 
-  /** Rule id → the instant (epoch ms) it last executed. Cooldown state. */
+  /**
+   * Rule id → the instant (epoch ms) it last executed. The only *cross-run*
+   * state the engine keeps, and the only state a run mutates in place.
+   *
+   * It is bounded by {@link MAX_TRACKED_RULES}: the map holds at most one entry
+   * per distinct rule id ever run, and once it reaches the cap the stalest
+   * entry (the earliest execution) is evicted before a new one is added — the
+   * rule that has waited longest for its cooldown to lapse is the safest to
+   * forget, since forgetting it can only ever *admit* a run, never suppress a
+   * legitimate one.
+   */
   private readonly lastRunAt = new Map<string, number>();
-  /** Event ids already emitted. Dedup state, shared across runs. */
-  private readonly emittedEventIds = new Set<string>();
-  /** A run's local step counter, reset at the top of {@link AutomationEngine.run}. */
-  private steps = 0;
 
   constructor(options: AutomationEngineOptions) {
     this.projection = options.projection;
@@ -406,6 +451,11 @@ export class AutomationEngine {
    * involved rules; a rule whose actions exhaust it stops early rather than
    * overrunning.
    *
+   * The budget and the emitted-id dedup set live in this call's own
+   * {@link RunState}, so two runs over one engine — a dispatcher that does not
+   * await a background run, say — cannot reset or exhaust each other's budget.
+   * The only state shared across runs is the bounded cooldown map.
+   *
    * Returns a {@link RunReport}; it never throws for a rule it can reject.
    */
   async run(rules: readonly Rule[], trigger: Trigger): Promise<RunReport> {
@@ -415,12 +465,13 @@ export class AutomationEngine {
         ? `${trigger.projectId}\u0000${trigger.event}`
         : `${trigger.projectId}#direct`;
 
-    this.steps = 0;
+    // Local to THIS invocation: neither field is ever touched by another run.
+    const state: RunState = { steps: 0, emittedEventIds: new Set() };
     const reports: RuleRunReport[] = [];
     const emittedEvents: EmittedEvent[] = [];
 
     for (const rule of rules) {
-      reports.push(await this.runRule(rule, trigger, depth, emittedEvents));
+      reports.push(await this.runRule(rule, trigger, depth, state, emittedEvents));
     }
 
     return {
@@ -437,9 +488,13 @@ export class AutomationEngine {
     return this.lastRunAt.get(ruleId);
   }
 
-  /** Whether an event id has already been emitted by this engine. */
-  hasEmitted(eventId: string): boolean {
-    return this.emittedEventIds.has(eventId);
+  /**
+   * The number of rules whose cooldown this engine currently remembers. Bounded
+   * by {@link MAX_TRACKED_RULES} — the caller-visible proof that the cross-run
+   * state does not grow without limit.
+   */
+  get trackedRuleCount(): number {
+    return this.lastRunAt.size;
   }
 
   // -------------------------------------------------------------------------
@@ -450,6 +505,7 @@ export class AutomationEngine {
     rule: Rule,
     trigger: Trigger,
     depth: number,
+    state: RunState,
     emittedEvents: EmittedEvent[],
   ): Promise<RuleRunReport> {
     // 1. Structural rejection: a graph past the step limit never runs.
@@ -479,7 +535,7 @@ export class AutomationEngine {
     // 3. Conditions: all must hold (AND). A false condition means no actions.
     const verdicts: boolean[] = [];
     for (const condition of rule.conditions) {
-      this.steps += 1;
+      state.steps += 1;
       verdicts.push(await this.evaluate(condition, trigger.projectId));
     }
     if (verdicts.some((held) => !held)) {
@@ -494,19 +550,19 @@ export class AutomationEngine {
     // 4. Actions: run in order, bounded by the run's remaining step budget.
     const outcomes: ActionOutcome[] = [];
     for (const action of rule.actions) {
-      if (this.steps >= this.maxSteps) {
+      if (state.steps >= this.maxSteps) {
         outcomes.push({ type: action.type, executed: false, skipped: "step_limit" });
         continue;
       }
-      this.steps += 1;
+      state.steps += 1;
       // Actions after the first execute unconditionally: a failing action is
       // recorded and the pipeline continues (no rollback — partial failure is
       // appending the report and carrying on, not unwinding).
-      outcomes.push(await this.execute(action, rule, trigger, depth, emittedEvents));
+      outcomes.push(await this.execute(action, rule, trigger, depth, state, emittedEvents));
     }
 
     // A rule that ran records its execution, which is what starts its cooldown.
-    this.lastRunAt.set(rule.id, now);
+    this.rememberExecution(rule.id, now);
 
     return {
       ruleId: rule.id,
@@ -576,6 +632,7 @@ export class AutomationEngine {
     rule: Rule,
     trigger: Trigger,
     depth: number,
+    state: RunState,
     emittedEvents: EmittedEvent[],
   ): Promise<ActionOutcome> {
     switch (action.type) {
@@ -583,7 +640,7 @@ export class AutomationEngine {
         return this.executeSetVariable(action, trigger.projectId);
 
       case "emit_event":
-        return this.executeEmitEvent(action, trigger, depth, emittedEvents);
+        return this.executeEmitEvent(action, trigger, depth, state, emittedEvents);
 
       case "call_integration": {
         const result = await this.integrations.call({
@@ -634,6 +691,7 @@ export class AutomationEngine {
     action: EmitEventAction,
     trigger: Trigger,
     depth: number,
+    state: RunState,
     emittedEvents: EmittedEvent[],
   ): ActionOutcome {
     // 1. Depth cap: the cascade stops at the limit (ST-U1 / INV-U1).
@@ -644,12 +702,13 @@ export class AutomationEngine {
     if (action.eventId === undefined || action.eventId.length === 0) {
       return { type: "emit_event", executed: false, skipped: "missing_event_id" };
     }
-    // 3. Dedup: the same id is delivered once, however often it is emitted.
-    if (this.emittedEventIds.has(action.eventId)) {
+    // 3. Dedup: the same id is delivered once per run, however often it is
+    //    emitted — the set is this run's, so a separate run is unconstrained.
+    if (state.emittedEventIds.has(action.eventId)) {
       return { type: "emit_event", executed: false, skipped: "duplicate_event", detail: action.eventId };
     }
 
-    this.emittedEventIds.add(action.eventId);
+    state.emittedEventIds.add(action.eventId);
     emittedEvents.push({
       eventId: action.eventId,
       event: action.event,
@@ -657,6 +716,27 @@ export class AutomationEngine {
       depth: depth + 1,
     });
     return { type: "emit_event", executed: true };
+  }
+
+  /**
+   * Record a rule's execution and keep the cooldown map bounded.
+   *
+   * The map is `MAX_TRACKED_RULES` entries at most: once it is full, the entry
+   * with the earliest execution instant is dropped before the new one is
+   * written — the stalest cooldown, so the eviction can only ever let a run
+   * through early, never silence one that is due.
+   */
+  private rememberExecution(ruleId: string, now: number): void {
+    const existing = this.lastRunAt.get(ruleId);
+    // Refresh in place: a re-execution moves the rule to the map's tail, so
+    // insertion order stays oldest-first and eviction is a single `.keys()`.
+    if (existing !== undefined) {
+      this.lastRunAt.delete(ruleId);
+    } else if (this.lastRunAt.size >= MAX_TRACKED_RULES) {
+      const stalest = this.lastRunAt.keys().next().value;
+      if (stalest !== undefined) this.lastRunAt.delete(stalest);
+    }
+    this.lastRunAt.set(ruleId, now);
   }
 }
 

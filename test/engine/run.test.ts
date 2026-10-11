@@ -4,9 +4,11 @@ import {
   InMemoryProjection,
   MAX_EVENT_DEPTH,
   MAX_STEPS,
+  MAX_TRACKED_RULES,
   RecordingExecutor,
   type Action,
   type Condition,
+  type ProjectionReader,
   type Rule,
 } from "../../worker/src/platform/engine/run";
 
@@ -18,18 +20,21 @@ import {
  * engine's own behaviour: no mocking of the code under test, no clock but the
  * one the test owns.
  *
- * The five contracts, and the invariant each pins:
+ * The six contracts, and the invariant each pins:
  *
  *   1. **Self-trigger stops** (ST-U1 / INV-U1, INV-U4) — a rule whose
  *      `set_variable` wakes itself terminates at the depth cap, and the number
  *      of executions is exactly the cap plus one — not unbounded.
  *   2. **Cooldown suppresses oscillation** (ST-U3 / INV-U3) — 100 oscillations
  *      inside one cooldown window execute the rule once, not 100 times.
- *   3. **Duplicate event id runs once** — a repeated `emit_event` id delivers
- *      one event.
+ *   3. **Duplicate event id runs once per run** — a repeated `emit_event` id
+ *      delivers one event within a run and does not leak across runs.
  *   4. **Oversize graph is rejected** — >100 steps is a rejection, not a run.
  *   5. **Conditions branch** (FR-AUT-03) — `if_variable` and `time_window`
  *      select the true branch and skip the false one from projection values.
+ *   6. **Concurrent runs keep their own budget** — two runs interleaved over
+ *      one engine each obey {@link MAX_STEPS} exactly as a solo run does, and
+ *      the cross-run cooldown memory stays bounded.
  */
 
 const PROJECT = "proj_run";
@@ -46,6 +51,53 @@ interface Harness {
   advance: (ms: number) => void;
   /** The exact instant the engine's clock currently reports. */
   now: () => number;
+}
+
+/**
+ * A {@link ProjectionReader} that answers `on = 1` and parks its first `budget`
+ * reads on a fresh microtask.
+ *
+ * Parking is the whole point: while one run awaits such a read, the scheduler
+ * resumes any *other* run's action loop, so two runs over one engine genuinely
+ * interleave — the only way a shared, cross-`await` step counter can be caught
+ * resetting under the other run.
+ */
+class YieldingProjection implements ProjectionReader {
+  private parked = 0;
+
+  constructor(private readonly budget = 2) {}
+
+  latestValue(_projectId: string, key: string): Promise<number | null> {
+    const value = key === "on" ? 1 : null;
+    if (this.parked >= this.budget) return Promise.resolve(value);
+    this.parked += 1;
+    // `new Promise` (not `Promise.withResolvers`) keeps the module compiling at
+    // the repo's `ES2022` lib target.
+    return new Promise((resolve) => queueMicrotask(() => resolve(value)));
+  }
+}
+
+/**
+ * A rule whose graph is exactly {@link MAX_STEPS} nodes — one condition plus
+ * `MAX_STEPS - 1` actions — and so is accepted. Every node fits the budget, so
+ * run alone the rule ends with **zero** `step_limit` refusals: the day the
+ * budget is spent exactly is the day nothing is refused.
+ */
+function budgetProbeRule(id: string): Rule {
+  const actions: Action[] = Array.from({ length: MAX_STEPS - 1 }, (_, i) =>
+    setVariable(`k${i}`, i),
+  );
+  return {
+    id,
+    cooldownMs: 0,
+    conditions: [{ type: "if_variable", key: "on", op: "eq", value: 1 }],
+    actions,
+  };
+}
+
+/** The `step_limit` refusals a rule's report carries — zero when it fit its budget. */
+function stepLimitCount(report: { rules: readonly { actions: readonly { skipped?: string }[] }[] }): number {
+  return report.rules[0].actions.filter((a) => a.skipped === "step_limit").length;
 }
 
 /** Build a fully-injected engine whose clock the test drives by hand. */
@@ -148,7 +200,7 @@ describe("ST-U1 — self-trigger loop stops at the depth cap (INV-U1, INV-U4)", 
     expect(last.emittedEvents).toHaveLength(0);
   });
 
-  it("counts each hop's emit once and refuses past the cap", async () => {
+  it("emits its id on every hop, refused only past the depth cap", async () => {
     const h = harness();
     const rule: Rule = {
       id: "self",
@@ -156,19 +208,23 @@ describe("ST-U1 — self-trigger loop stops at the depth cap (INV-U1, INV-U4)", 
       conditions: [],
       actions: [emitEvent("tick", "same-id")],
     };
-    // One engine, five hops: each hop must carry a *fresh* id, or dedup (not
-    // depth) is what stops it — that separation is asserted in the next block.
-    for (let depth = 0; depth <= MAX_EVENT_DEPTH; depth += 1) {
+    // One engine, several hops. The dedup set is per run, so the *same* id on
+    // every hop is not a duplicate across runs: depth is the only layer that
+    // stops the cascade. Hops below the cap all emit; the cap itself refuses.
+    for (let depth = 0; depth < MAX_EVENT_DEPTH; depth += 1) {
       const report = await h.engine.run([rule], {
         projectId: PROJECT,
         event: "tick",
         depth,
       });
-      // The first hop claims `same-id`; later hops are refused as duplicates,
-      // which is the *other* anti-loop layer doing its job.
-      const emitted = report.emittedEvents.length;
-      expect(emitted).toBe(depth === 0 ? 1 : 0);
+      expect(report.emittedEvents.map((e) => e.eventId)).toEqual(["same-id"]);
     }
+    const beyond = await h.engine.run([rule], {
+      projectId: PROJECT,
+      event: "tick",
+      depth: MAX_EVENT_DEPTH,
+    });
+    expect(beyond.emittedEvents).toHaveLength(0);
   });
 });
 
@@ -231,8 +287,33 @@ describe("ST-U3 — cooldown prevents a trigger storm (INV-U3)", () => {
 // 3. Duplicate event id → executed once
 // ---------------------------------------------------------------------------
 
-describe("duplicate event id is delivered once", () => {
-  it("refuses a second emit carrying an id it has already seen", async () => {
+describe("duplicate event id is delivered once per run", () => {
+  it("dedupes a repeated id inside one run", async () => {
+    const h = harness();
+    // One run, the same id emitted twice: the second emit is refused. The
+    // dedup set is the run's own, and within a run one id means one event.
+    const rule: Rule = {
+      id: "dedup",
+      cooldownMs: 0,
+      conditions: [],
+      actions: [emitEvent("webhook", "delivery-1", { n: 1 }), emitEvent("webhook", "delivery-1", { n: 2 })],
+    };
+
+    const report = await h.engine.run([rule], { projectId: PROJECT });
+
+    expect(report.emittedEvents).toHaveLength(1);
+    expect(report.emittedEvents[0]).toMatchObject({ eventId: "delivery-1", depth: 1 });
+    expect(
+      report.rules[0].actions.filter((a) => a.type === "emit_event")[1],
+    ).toEqual({
+      type: "emit_event",
+      executed: false,
+      skipped: "duplicate_event",
+      detail: "delivery-1",
+    });
+  });
+
+  it("does not leak an id from one run into the next", async () => {
     const h = harness();
     const rule: Rule = {
       id: "dedup",
@@ -241,24 +322,14 @@ describe("duplicate event id is delivered once", () => {
       actions: [emitEvent("webhook", "delivery-1", { n: 1 })],
     };
 
-    // The first delivery emits; an at-least-once producer redelivers the same
-    // id, which must not become a second event.
+    // The dedup set is per run, so a *fresh* run emits the same id again. A
+    // redelivery is throttled across runs by cooldown, not by event id — the
+    // id is an intra-run identity, so nothing crosses the run boundary.
     const first = await h.engine.run([rule], { projectId: PROJECT });
     const second = await h.engine.run([rule], { projectId: PROJECT });
 
-    expect(first.emittedEvents).toHaveLength(1);
-    expect(first.emittedEvents[0]).toMatchObject({ eventId: "delivery-1", depth: 1 });
-
-    expect(second.emittedEvents).toHaveLength(0);
-    expect(
-      second.rules[0].actions.find((a) => a.type === "emit_event"),
-    ).toEqual({
-      type: "emit_event",
-      executed: false,
-      skipped: "duplicate_event",
-      detail: "delivery-1",
-    });
-    expect(h.engine.hasEmitted("delivery-1")).toBe(true);
+    expect(first.emittedEvents.map((e) => e.eventId)).toEqual(["delivery-1"]);
+    expect(second.emittedEvents.map((e) => e.eventId)).toEqual(["delivery-1"]);
   });
 
   it("refuses an emit with no id (it could not be deduped)", async () => {
@@ -494,5 +565,125 @@ describe("actions and report shape", () => {
     expect(report.rules.every((r) => r.status === "executed")).toBe(true);
     expect(report.maxSteps).toBe(MAX_STEPS);
     expect(report.depth).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 6. Concurrency — a run's budget and dedup set are its own
+// ---------------------------------------------------------------------------
+
+describe("concurrent runs keep their own step budget (INV: one run, one budget)", () => {
+  it("gives each of two interleaved runs the budget a solo run gets", async () => {
+    // The baseline: the rule alone spends its budget exactly and is refused
+    // nothing. This is the state each concurrent run must reproduce.
+    const soloExec = new RecordingExecutor();
+    const solo = await new AutomationEngine({
+      projection: new YieldingProjection(),
+      executor: soloExec,
+      integrations: soloExec,
+    }).run([budgetProbeRule("solo")], { projectId: PROJECT });
+    expect(solo.rules[0].status).toBe("executed");
+    expect(solo.rules[0].actions).toHaveLength(MAX_STEPS - 1);
+    expect(stepLimitCount(solo)).toBe(0); // a solo run refuses nothing
+
+    // Two runs over ONE engine: the first parks on its projection read while
+    // the second starts, so their action loops genuinely overlap. This is the
+    // shape a background dispatcher creates when it does not await a run
+    // (see test/telemetry/events.test.ts).
+    const exec = new RecordingExecutor();
+    const engine = new AutomationEngine({
+      projection: new YieldingProjection(),
+      executor: exec,
+      integrations: exec,
+    });
+    const [first, second] = await Promise.all([
+      engine.run([budgetProbeRule("first")], { projectId: PROJECT }),
+      engine.run([budgetProbeRule("second")], { projectId: PROJECT }),
+    ]);
+
+    // Each run must reach the solo state: every action its graph declares, and
+    // not one `step_limit` refusal. A counter shared between the runs (reset at
+    // the top of each `run`) would make one run spend budget the other had
+    // already consumed, so refusals would appear and executed actions would
+    // fall short — both directions are pinned here.
+    for (const report of [first, second]) {
+      expect(report.rules[0].status).toBe("executed");
+      expect(report.rules[0].actions).toHaveLength(MAX_STEPS - 1);
+      expect(stepLimitCount(report)).toBe(0);
+    }
+    // 2 rules × (MAX_STEPS - 1) writes, none swallowed by the other run's budget.
+    expect(setWrites(exec)).toBe(2 * (MAX_STEPS - 1));
+  });
+
+  it("keeps an interleaved run's dedup set independent of the other run's", async () => {
+    const rule: Rule = {
+      id: "shared-id",
+      cooldownMs: 0,
+      conditions: [],
+      actions: [emitEvent("tick", "same-id")],
+    };
+    const exec = new RecordingExecutor();
+    const engine = new AutomationEngine({
+      projection: new YieldingProjection(),
+      executor: exec,
+      integrations: exec,
+    });
+
+    // Both runs emit the *same* event id; because the dedup set is per run,
+    // each delivers one event. A shared set would let whichever ran second see
+    // a duplicate and emit nothing.
+    const [a, b] = await Promise.all([
+      engine.run([rule], { projectId: PROJECT }),
+      engine.run([rule], { projectId: PROJECT }),
+    ]);
+    expect(a.emittedEvents.map((e) => e.eventId)).toEqual(["same-id"]);
+    expect(b.emittedEvents.map((e) => e.eventId)).toEqual(["same-id"]);
+  });
+});
+
+describe("cross-run state is bounded", () => {
+  it("caps the cooldown memory at MAX_TRACKED_RULES, however many rules it sees", async () => {
+    const h = harness();
+    // Never two executions of one rule inside its (huge) window, so this is
+    // purely about how many *distinct* rules the instance remembers.
+    const overflow = MAX_TRACKED_RULES + 250;
+    for (let i = 0; i < overflow; i += 1) {
+      await h.engine.run(
+        [{ id: `rule-${i}`, cooldownMs: 1_000_000, conditions: [], actions: [] }],
+        { projectId: PROJECT },
+      );
+    }
+
+    // Bounded — not one entry per rule ever seen — and still functional: the
+    // most recent rule's cooldown is retained, so it is throttled on a re-run.
+    expect(h.engine.trackedRuleCount).toBe(MAX_TRACKED_RULES);
+    const recent = await h.engine.run(
+      [{ id: `rule-${overflow - 1}`, cooldownMs: 1_000_000, conditions: [], actions: [] }],
+      { projectId: PROJECT },
+    );
+    expect(recent.rules[0].status).toBe("skipped_cooldown");
+  });
+
+  it("evicts the stalest cooldown first, never the freshest", async () => {
+    const h = harness();
+    for (let i = 0; i < MAX_TRACKED_RULES; i += 1) {
+      await h.engine.run(
+        [{ id: `r${i}`, cooldownMs: 1_000_000, conditions: [], actions: [] }],
+        { projectId: PROJECT },
+      );
+      h.advance(1); // each later rule executed at a strictly later instant
+    }
+
+    // A new, distinct rule overflows the map; the earliest-executed entry — the
+    // one whose cooldown is closest to lapsing — is the one forgotten.
+    await h.engine.run(
+      [{ id: "newcomer", cooldownMs: 1_000_000, conditions: [], actions: [] }],
+      { projectId: PROJECT },
+    );
+
+    expect(h.engine.trackedRuleCount).toBe(MAX_TRACKED_RULES);
+    expect(h.engine.lastExecution("r0")).toBeUndefined(); // stalest, evicted
+    expect(h.engine.lastExecution("newcomer")).toBeDefined();
+    expect(h.engine.lastExecution(`r${MAX_TRACKED_RULES - 1}`)).toBeDefined(); // freshest, kept
   });
 });
