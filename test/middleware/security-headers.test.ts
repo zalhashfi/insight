@@ -29,7 +29,35 @@ function makeApp() {
   return app;
 }
 
+/**
+ * Literal CSP/HSTS security-floor expectations.
+ *
+ * These are written out by hand instead of referencing the exported
+ * `DEFAULT_*` constants on purpose: if someone relaxed the policy inside the
+ * middleware (e.g. `default-src *`, a removed `frame-ancestors`, a shorter
+ * HSTS max-age) the imported constant would move in lockstep with the source
+ * and the test would keep passing. Hard-coded strings make the security
+ * contract independently verifiable — a weakened policy fails here.
+ */
+const CSP_REQUIRES = [
+  "default-src 'self'", // same-origin only; no `*`/`data:`/`http:` widening
+  "frame-ancestors 'none'", // not embeddable in any frame/iframe
+  "base-uri 'self'", // no <base> hijacking for relative URLs
+] as const;
+
+/** Directives/loosening tokens a secure CSP must NOT contain. */
+const CSP_FORBIDS = [
+  "default-src *",
+  "default-src 'unsafe-inline'",
+  "default-src 'unsafe-eval'",
+  "frame-ancestors *",
+] as const;
+
+const HSTS_REQUIRES = ["max-age=31536000", "includeSubDomains"] as const;
+
 const EXPECTED: Record<string, string> = {
+  // Mixed literal + constant-by-name: the constants below pin the *literal*
+  // values, while the constant import still guards the exact wire value.
   "Content-Security-Policy": DEFAULT_CONTENT_SECURITY_POLICY,
   "Strict-Transport-Security": DEFAULT_STRICT_TRANSPORT_SECURITY,
   "X-Content-Type-Options": "nosniff",
@@ -119,6 +147,77 @@ describe("securityHeaders middleware", () => {
     assertAllHeaders(res, "double-mounted");
     const csp = res.headers.get("Content-Security-Policy") ?? "";
     expect(csp).toBe(DEFAULT_CONTENT_SECURITY_POLICY);
+  });
+
+  it("pins the exact CSP wire value to literal directives (no importing the source constant as truth)", async () => {
+    const res = await makeApp().request("/ok");
+    const csp = res.headers.get("Content-Security-Policy") ?? "";
+
+    // Exact literal match — deliberately NOT `expect(csp).toBe(DEFAULT_...)`
+    // so a relaxed source constant cannot silently redefine the expectation.
+    expect(csp).toBe(
+      "default-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+    );
+  });
+
+  it("CSP contains each concrete hardening directive", async () => {
+    const res = await makeApp().request("/ok");
+    const csp = res.headers.get("Content-Security-Policy") ?? "";
+
+    for (const directive of CSP_REQUIRES) {
+      expect(csp, `CSP must contain "${directive}"`).toContain(directive);
+    }
+  });
+
+  it("CSP forbids widening the policy (no unsafe/inline/eval/wildcard)", async () => {
+    const res = await makeApp().request("/ok");
+    const csp = res.headers.get("Content-Security-Policy") ?? "";
+
+    for (const forbidden of CSP_FORBIDS) {
+      expect(csp, `CSP must not contain "${forbidden}"`).not.toContain(
+        forbidden,
+      );
+    }
+    // The default source must be exactly same-origin, nothing broader.
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).not.toMatch(/default-src\s+(?![^;]*'self')/);
+  });
+
+  it("pins the exact HSTS wire value and its required tokens", async () => {
+    const res = await makeApp().request("/ok");
+    const hsts = res.headers.get("Strict-Transport-Security") ?? "";
+
+    expect(hsts).toBe("max-age=31536000; includeSubDomains");
+    for (const token of HSTS_REQUIRES) {
+      expect(hsts, `HSTS must contain "${token}"`).toContain(token);
+    }
+  });
+
+  it("literal CSP/HSTS floors hold on 404 and 500 responses too", async () => {
+    const app = makeApp();
+
+    for (const [label, path] of [
+      ["404", "/definitely-not-a-route"],
+      ["500", "/boom"],
+    ] as const) {
+      const res = await app.request(path);
+      const csp = res.headers.get("Content-Security-Policy") ?? "";
+      const hsts = res.headers.get("Strict-Transport-Security") ?? "";
+
+      for (const directive of CSP_REQUIRES) {
+        expect(csp, `${label}: CSP must contain "${directive}"`).toContain(
+          directive,
+        );
+      }
+      for (const forbidden of CSP_FORBIDS) {
+        expect(csp, `${label}: CSP must not contain "${forbidden}"`).not.toContain(
+          forbidden,
+        );
+      }
+      for (const token of HSTS_REQUIRES) {
+        expect(hsts, `${label}: HSTS must contain "${token}"`).toContain(token);
+      }
+    }
   });
 
   it("honours a partial override without dropping the other headers", async () => {
