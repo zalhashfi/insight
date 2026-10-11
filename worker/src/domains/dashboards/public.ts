@@ -168,6 +168,32 @@ export interface ProjectionSource {
   snapshot(projectId: string, limit: number): Promise<readonly Point[]>;
 }
 
+/**
+ * The live-frame seam — how a public subscriber learns about *changes*.
+ *
+ * `subscribe` registers a callback that receives each projected update as it
+ * happens and returns an `unsubscribe` function the caller invokes to stop.
+ * This is the streaming twin of {@link ProjectionSource.snapshot}: the same
+ * fan-out (`DashboardDO`'s live path) answers on the other side, minus the
+ * cursor, because a public viewer keeps no watermark of its own.
+ *
+ * Optional on {@link PublicDashboardOptions}: a deploy that serves snapshots
+ * only (no fan-out binding) omits it, and the stream route then answers that
+ * streaming is unavailable rather than fabricating frames.
+ */
+export interface FrameSource {
+  /**
+   * Register `onFrame` for `projectId`'s live updates; returns a function that
+   * detaches it. Frames are delivered as {@link Point}-shaped values and are
+   * filtered by the subscriber (this module's allow-list), never pre-filtered
+   * by the seam.
+   */
+  subscribe(
+    projectId: string,
+    onFrame: (frame: Point) => void,
+  ): (() => void) | Promise<() => void>;
+}
+
 /** A projected reading: the shape the public payload exposes, and no more. */
 export interface Point {
   readonly device: string;
@@ -201,6 +227,12 @@ export interface PublicDashboardOptions {
   readonly now?: Clock;
   /** Points per snapshot; defaults to {@link DEFAULT_PUBLIC_SNAPSHOT_POINTS}. */
   readonly snapshotLimit?: number;
+  /**
+   * The live-frame seam backing the public stream route. Optional: a deploy
+   * without a fan-out binding serves snapshots only, and the stream route
+   * reports streaming as unavailable instead of inventing frames.
+   */
+  readonly frames?: FrameSource;
 }
 
 // ---------------------------------------------------------------------------
@@ -355,6 +387,14 @@ export interface PublicDashboard {
   snapshot(): Promise<readonly Point[]>;
   /** The frame to deliver for `point`, or `null` when it is not public. */
   filterFrame(point: Point): StreamFrame | null;
+  /**
+   * Subscribe to the project's live updates, delivering **only** allow-listed
+   * frames to `sink`. Returns an `unsubscribe` function; throws `not_found`
+   * when the deploy has no frame seam (streaming is unavailable). Every frame
+   * passes through the *same* allow-list as {@link snapshot}, so the live path
+   * can never leak a variable outside the layout.
+   */
+  subscribe(sink: (frame: StreamFrame) => void): Promise<() => void>;
   /** Refuse (throw `read_only`) any attempted write through this view. */
   assertReadOnly(op: string): never;
 }
@@ -441,6 +481,7 @@ export class PublicDashboardService {
   readonly #shares: ShareResolver;
   readonly #layouts: LayoutLookup;
   readonly #projection: ProjectionSource;
+  readonly #frames: FrameSource | undefined;
   readonly #hash: TokenHasher;
   readonly #now: Clock;
   readonly #snapshotLimit: number;
@@ -449,6 +490,7 @@ export class PublicDashboardService {
     this.#shares = options.shares;
     this.#layouts = options.layouts;
     this.#projection = options.projection;
+    this.#frames = options.frames;
     this.#hash = options.hash ?? defaultHasher;
     this.#now = options.now ?? defaultClock;
     this.#snapshotLimit = options.snapshotLimit ?? DEFAULT_PUBLIC_SNAPSHOT_POINTS;
@@ -543,6 +585,7 @@ export class PublicDashboardService {
     const variables = Object.freeze([...allow]);
     const projection = this.#projection;
     const limit = this.#snapshotLimit;
+    const frames = this.#frames;
 
     return {
       projectId,
@@ -579,6 +622,29 @@ export class PublicDashboardService {
        */
       filterFrame(point: Point): StreamFrame | null {
         return filterPoint(allow, point);
+      },
+
+      /**
+       * Subscribe to the project's live updates, delivering only allow-listed
+       * frames. The subscription is wired straight to {@link filterFrame}: a
+       * frame outside the layout is dropped (returns `null`) and never reaches
+       * `sink`, so the live path enforces the very same allow-list as the
+       * snapshot — a change published after the view was minted is filtered by
+       * the layout that view captured.
+       *
+       * When the deploy supplied no frame seam, streaming is unavailable and
+       * this refuses with the module's uniform `not_found` (the public surface
+       * never reveals *why* a capability is missing).
+       */
+      async subscribe(sink: (frame: StreamFrame) => void): Promise<() => void> {
+        if (frames === undefined) {
+          throw new PublicDashboardError("not_found", "streaming is unavailable");
+        }
+        const unsubscribe = await frames.subscribe(projectId, (frame) => {
+          const admitted = filterPoint(allow, frame);
+          if (admitted !== null) sink(admitted);
+        });
+        return unsubscribe;
       },
 
       /**
