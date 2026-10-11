@@ -49,16 +49,30 @@
  *      result cannot accidentally log a token. Only the transport that actually
  *      dials the provider ever holds the opened value, for the length of one call.
  *
- * ## `/test` is a mode of the *same* executor, not a second code path
+ * ## `/test` is a mode of the *same* executor, **enforced** by this module
  *
- * {@link testIntegration} builds a **synthetic** request: it renders the exact
- * same way, but marks the request `synthetic`, and hands it to a transport that
- * is the caller's. The difference between "execute" and "test" is therefore
- * *one flag and the transport the caller injected* — never a branch that could
- * drift from the real path and give a false sense of safety. A test proves the
- * two things the requirement cares about in one breath: the synthetic request is
- * what *would* be sent (asserted through the fake), and no real effect follows
- * (the fake is the only transport, and it makes none).
+ * {@link testIntegration} renders exactly as a live call does, but the module
+ * itself guarantees no real effect — it does **not** hand the decision to the
+ * deploy's transport. Two mechanisms make a live `/test` *inexpressible* rather
+ * than merely discouraged:
+ *
+ *   1. **The transport is typed and checked dry-run.** A transport declares
+ *      `kind: "live" | "dry-run"`; {@link testIntegration} accepts only a
+ *      {@link DryRunTransport} (a type error to pass a live one) and *re-checks
+ *      the marker at runtime*, refusing with `live_transport_in_test` before a
+ *      byte is rendered or a secret is opened. So a live transport can never be
+ *      dialed by a `/test`, however the caller was wired.
+ *   2. **The secret is never opened on the test path.** A `/test` renders the
+ *      body and config it *would* send (so the request is assertable), but every
+ *      `auth` value is the fixed {@link REDACTED_SECRET} marker — the runtime
+ *      skips {@link openSecrets} entirely, so even a recording dry-run transport
+ *      never holds a live credential. "The real secret never travels on a
+ *      `/test`" is thus a property of this module, provable by asserting the
+ *      request a recording transport received carries no plaintext.
+ *
+ * The difference between "execute" and "test" is a flag, a transport *kind*, and
+ * the redaction — never a branch that could drift from the real path and give a
+ * false sense of safety.
  *
  * ## Unknown providers are rejected, loudly
  *
@@ -82,7 +96,9 @@ export type IntegrationRuntimeErrorCode =
   | "unknown_provider"
   | "unknown_action"
   | "missing_config"
-  | "missing_secret";
+  | "missing_secret"
+  /** A `/test` was handed a transport that may perform a live effect. */
+  | "live_transport_in_test";
 
 /**
  * The one error this module throws for a refusal. `code` is the stable part a
@@ -122,9 +138,10 @@ export interface RenderedRequest {
   /** The action being invoked. */
   readonly action: string;
   /**
-   * `true` for a `/test` request. A real transport should treat a synthetic
-   * request as "render and report, do not dial" — the marker travels with the
-   * request so a caller can route it to a dry-run sink unambiguously.
+   * `true` for a `/test` request. A synthetic request is **never** sent to a
+   * live transport: the runtime enforces that (see {@link testIntegration}), and
+   * its `auth` is redacted to {@link REDACTED_SECRET}. The marker still travels
+   * on the request so a recording dry-run transport can distinguish the two.
    */
   readonly synthetic: boolean;
   /** The resolved body/parameters (the action template, rendered). */
@@ -150,10 +167,57 @@ export interface RenderedRequest {
  * test injects one that records. One method, because an integration call is one
  * request — retries, signing and timeouts are the transport's business, not the
  * runtime's.
+ *
+ * `kind` is the **enforcement discriminator**: a transport must declare whether
+ * it may perform a live effect. {@link executeIntegration} accepts either, but
+ * {@link testIntegration} accepts only a {@link DryRunTransport}, and it
+ * re-checks `kind` at runtime. A live transport is therefore not merely
+ * "supposed" to be kept away from a `/test` — it cannot be expressed, and is
+ * refused if it is smuggled in past the type.
  */
 export interface IntegrationTransport {
+  /**
+   * `"live"` — this transport may perform a real outbound effect (it dials).
+   * `"dry-run"` — it never performs a live effect; it renders, records or
+   * reports, and returns.
+   */
+  readonly kind: "live" | "dry-run";
   /** Perform (or refuse, or merely record) one rendered request. */
   send(request: RenderedRequest): Promise<TransportResponse>;
+}
+
+/** A transport that may perform a real outbound effect. Only the live path takes one. */
+export type LiveTransport = IntegrationTransport & { readonly kind: "live" };
+
+/**
+ * A transport that never performs a live effect — it records or reports only.
+ * {@link testIntegration} requires one, so a `/test` cannot reach a live egress.
+ */
+export type DryRunTransport = IntegrationTransport & { readonly kind: "dry-run" };
+
+/**
+ * The value a `/test` carries in place of every opened secret. A `/test` renders
+ * its body and config exactly as a live call would (so the request is
+ * assertable), but each `auth` value is this marker: the runtime does not open
+ * the secret at all on the test path, so no plaintext credential ever rides to a
+ * transport — dry-run or otherwise.
+ */
+export const REDACTED_SECRET = "[redacted:test]";
+
+/**
+ * A transport the runtime itself owns for `/test`: it declares `dry-run`,
+ * performs no I/O, and reports a synthetic result. It is the safe default for a
+ * deploy whose `/test` route has no observing dry-run transport of its own; a
+ * caller that wants to capture "what would be sent" supplies its own
+ * {@link DryRunTransport} instead.
+ */
+export function dryRunTransport(): DryRunTransport {
+  return {
+    kind: "dry-run",
+    send(request: RenderedRequest): Promise<TransportResponse> {
+      return Promise.resolve({ status: 0, body: { dryRun: true, synthetic: request.synthetic } });
+    },
+  };
 }
 
 /**
@@ -307,6 +371,12 @@ async function openSecrets(
  * coded refusal (`missing_config` / `missing_secret`); a supplied-but-unresolved
  * value follows the interpolation policy. The check is on presence, not truth,
  * so an empty-but-supplied value is the author's business, not a surprise.
+ *
+ * `redactAuth` forces every `auth` value to {@link REDACTED_SECRET}: used by the
+ * `/test` path, where `openedSecrets` never holds a plaintext (the module skips
+ * {@link openSecrets} there), so the marker documents the redaction rather than
+ * leaking what would have been sent. Body and config render identically either
+ * way, so a `/test` still shows the request that *would* go out.
  */
 function buildRequest(
   provider: ProviderManifest,
@@ -315,6 +385,7 @@ function buildRequest(
   openedSecrets: Readonly<Record<string, string>>,
   render: (template: string) => string,
   synthetic: boolean,
+  redactAuth: boolean,
 ): RenderedRequest {
   for (const key of provider.requiredConfigFields) {
     if (!Object.hasOwn(config, key)) {
@@ -339,7 +410,9 @@ function buildRequest(
   // Only secrets the manifest names are attached, so an unexpected key cannot
   // smuggle a value into the request.
   for (const key of provider.secretFields) {
-    if (Object.hasOwn(openedSecrets, key)) renderedAuth[key] = render(openedSecrets[key]);
+    if (Object.hasOwn(openedSecrets, key)) {
+      renderedAuth[key] = redactAuth ? REDACTED_SECRET : render(openedSecrets[key]);
+    }
   }
 
   return {
@@ -408,6 +481,7 @@ export async function executeIntegration(
     openedSecrets,
     render,
     input.synthetic ?? false,
+    false,
   );
   const response = await input.transport.send(request);
   // The transport got the `auth`-bearing request; the *caller* gets a copy whose
@@ -423,19 +497,65 @@ export async function executeIntegration(
 }
 
 /**
- * `/test`: execute the same action as a **synthetic** request — rendered exactly
- * as a live one, flagged `synthetic`, and handed to whatever transport the
- * caller injected.
+ * `/test`: run the same action as a **synthetic** request, with the module —
+ * not the caller's transport — guaranteeing that no real effect is possible.
  *
- * This is deliberately *not* a separate renderer: it is {@link executeIntegration}
- * with the flag set, so a test can never diverge from the live path and quietly
- * pass. "No real effect" is the transport's to guarantee (a production deployment
- * injects a dry-run transport here), and the synthetic marker travels on the
- * request so that guarantee is checkable at the transport boundary rather than
- * assumed.
+ * It uses the same renderer, resolver and builder as {@link executeIntegration},
+ * so a `/test` cannot drift from the live path: the body and config it produces
+ * are byte-for-byte what a live call would send. Two things are then enforced
+ * *here*, before anything is sent:
+ *
+ *   1. **The transport must be dry-run.** The parameter type admits only a
+ *      {@link DryRunTransport}, and the `kind` marker is re-checked at runtime —
+ *      so a live transport that was smuggled in past the type is refused with
+ *      `live_transport_in_test`, and `send` is never called on it.
+ *   2. **No secret is opened.** {@link openSecrets} is skipped; each `auth` value
+ *      is {@link REDACTED_SECRET}. Even the dry-run transport therefore receives
+ *      no live credential — "the real secret never rides a `/test`" holds by
+ *      construction, not by the transport's self-restraint.
+ *
+ * @throws {IntegrationRuntimeError} `live_transport_in_test`, plus every refusal
+ *   {@link executeIntegration} makes (`unknown_provider` / `unknown_action` /
+ *   `missing_config` / `missing_secret`), which a `/test` still enforces.
  */
-export function testIntegration(
-  input: Omit<ExecuteIntegrationInput, "synthetic">,
+export async function testIntegration(
+  input: Omit<ExecuteIntegrationInput, "synthetic" | "transport"> & {
+    readonly transport: DryRunTransport;
+  },
 ): Promise<IntegrationResult> {
-  return executeIntegration({ ...input, synthetic: true });
+  // The type already excludes a live transport; this closes the door on a value
+  // that reached us past the type (a cast at a loosely-typed boundary). We
+  // refuse before resolving anything, so not even a provider lookup happens.
+  if (input.transport.kind !== "dry-run") {
+    throw new IntegrationRuntimeError(
+      "live_transport_in_test",
+      'testIntegration: a /test may not use a live transport (kind must be "dry-run")',
+    );
+  }
+
+  const provider = requireProvider(input.providerId);
+  const action = requireAction(provider, input.action);
+  // The key set is preserved (so required-secret checks still fire) but no value
+  // is opened: a `/test` never decrypts a stored envelope.
+  const suppliedSecrets = Object.fromEntries(
+    Object.keys(input.secret ?? {}).map((key) => [key, REDACTED_SECRET]),
+  );
+  const render = renderer(input.scope ?? {}, input.strict ?? false);
+  const request = buildRequest(
+    provider,
+    action,
+    input.config ?? {},
+    suppliedSecrets,
+    render,
+    true,
+    true,
+  );
+  const response = await input.transport.send(request);
+  return {
+    providerId: provider.id,
+    action: action.name,
+    synthetic: true,
+    request: { ...request, auth: {} },
+    response,
+  };
 }

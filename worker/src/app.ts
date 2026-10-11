@@ -146,6 +146,8 @@ import {
 } from "./mcp/gate";
 import {
   testIntegration,
+  dryRunTransport,
+  type DryRunTransport,
   type ExecuteIntegrationInput,
   type IntegrationTransport,
   type IntegrationResult,
@@ -371,6 +373,15 @@ export interface AppDeps {
      */
     readonly integrations?: {
       readonly transport: IntegrationTransport;
+      /**
+       * The dry-run transport the `/test` route sends through. The runtime
+       * enforces that a `/test` never uses a live transport, so this must
+       * declare `kind: "dry-run"`. Omitted → the runtime's own
+       * {@link dryRunTransport} (no I/O, reports `{ dryRun: true }`) is used, so
+       * the safe default needs no wiring. Supply one to *observe* what a `/test`
+       * would send.
+       */
+      readonly testTransport?: DryRunTransport;
       /**
        * Resolve the caller to the project a `/test` execution is performed for,
        * or `null` to refuse. Omitted → the `/test` route is not mounted (the
@@ -830,14 +841,16 @@ function mountM4(app: App, deps: AppDeps): void {
         const input =
           integrations.openSecret !== undefined ? await integrations.openSecret(base, projectId) : base;
 
-        // A `/test` is always synthetic: rendered exactly as a live call but
-        // flagged `synthetic`, so the transport never dials and no real effect
-        // occurs. The runtime owns every refusal (unknown provider/action,
-        // missing field, unopenable secret) as its own typed error.
+        // A `/test` is always synthetic AND always dry-run: the runtime renders
+        // exactly what a live call would, redacts the secrets, and refuses any
+        // transport that is not declared `kind: "dry-run"` — so a `/test` cannot
+        // reach the live `transport`, by construction. A deploy that wants to
+        // observe the request supplies `testTransport`; otherwise the runtime's
+        // own no-I/O dry-run sink is used.
         try {
           const result: IntegrationResult = await testIntegration({
             ...input,
-            transport: integrations.transport,
+            transport: integrations.testTransport ?? dryRunTransport(),
           });
           // The runtime already emptied `request.auth`; the whole result passes
           // through the SAME structural redactor the MCP tools use, so an

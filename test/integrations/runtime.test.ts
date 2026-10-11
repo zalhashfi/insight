@@ -10,9 +10,11 @@ import {
 } from "../../worker/src/shared/integrations/index";
 import {
   IntegrationRuntimeError,
+  REDACTED_SECRET,
   executeIntegration,
   isIntegrationRuntimeError,
   testIntegration,
+  type DryRunTransport,
   type IntegrationTransport,
   type RenderedRequest,
   type TransportResponse,
@@ -58,6 +60,12 @@ import {
  * tests read back, and its emptiness after a refusal is the "no effect" proof.
  */
 class RecordingTransport implements IntegrationTransport {
+  /**
+   * A recorder performs no I/O, so it declares itself dry-run — honest, and the
+   * only kind a `/test` accepts. `executeIntegration` (the live path) takes any
+   * kind, so the same recorder stands in there too.
+   */
+  readonly kind = "dry-run" as const;
   readonly sent: RenderedRequest[] = [];
   private readonly response: TransportResponse;
 
@@ -335,7 +343,7 @@ describe("runtime: executes an action, interpolating {{var}} and a decrypted sec
 // ---------------------------------------------------------------------------
 
 describe("runtime: /test sends a synthetic request and causes no real effect", () => {
-  it("sends exactly what a live call would, but flagged synthetic", async () => {
+  it("renders the same body and config as a live call, but redacts every secret", async () => {
     const live = new RecordingTransport();
     const dry = new RecordingTransport();
     const common = {
@@ -348,20 +356,75 @@ describe("runtime: /test sends a synthetic request and causes no real effect", (
     await executeIntegration({ ...common, transport: live });
     const tested = await testIntegration({ ...common, transport: dry });
 
-    // Same rendered request in both paths — the test path is the live path…
+    // The body and config a `/test` offers are byte-for-byte the live ones — the
+    // request is fully assertable…
     expect(dry.sent[0].body).toEqual(live.sent[0].body);
-    expect(dry.sent[0].auth).toEqual(live.sent[0].auth);
     expect(dry.sent[0].config).toEqual(live.sent[0].config);
-    // …differing only in the synthetic marker.
+    // …but the real secret rode only the live call. The `/test` transport saw the
+    // redaction marker, never `https://discord/hook`.
+    expect(live.sent[0].auth.webhook_url).toBe("https://discord/hook");
+    expect(dry.sent[0].auth.webhook_url).toBe(REDACTED_SECRET);
+    expect(JSON.stringify(dry.sent[0])).not.toContain("https://discord/hook");
+    // …differing only in the synthetic marker (and the redaction above).
     expect(dry.sent[0].synthetic).toBe(true);
     expect(live.sent[0].synthetic).toBe(false);
     expect(tested.synthetic).toBe(true);
   });
 
+  it("refuses a live transport: a /test can never reach a real egress", async () => {
+    // The transport a deploy would actually dial with. The runtime must never
+    // hand it a `/test` request — the refusal is the module's, not the
+    // transport's cooperation.
+    class LiveTransport implements IntegrationTransport {
+      readonly kind = "live" as const;
+      readonly sent: RenderedRequest[] = [];
+      send(request: RenderedRequest): Promise<TransportResponse> {
+        this.sent.push(request);
+        return Promise.resolve({ status: 200, body: { delivered: true } });
+      }
+    }
+    const live = new LiveTransport();
+
+    // Smuggled in past the type (as a loosely-typed boundary could).
+    await expect(
+      testIntegration({
+        providerId: "slack",
+        action: "send_message",
+        scope: SCOPE,
+        secret: { webhook_url: { plain: "https://hooks.slack/x" } },
+        transport: live as unknown as DryRunTransport,
+      }),
+    ).rejects.toMatchObject({ code: "live_transport_in_test" });
+    // The live transport never ran: nothing was sent, real secret or otherwise.
+    expect(live.sent).toHaveLength(0);
+  });
+
+  it("never opens a stored envelope on the test path", async () => {
+    const { key } = await generateSecretKey();
+    const envelope = await encryptSecret("123456:AAH-secret-token", key);
+    const transport = new RecordingTransport();
+
+    await testIntegration({
+      providerId: "telegram",
+      action: "send_message",
+      config: { chat_id: "-100200" },
+      secret: { bot_token: { envelope, key } },
+      scope: SCOPE,
+      transport,
+    });
+
+    // A `/test` renders the request, so the auth key is present…
+    expect(transport.sent[0].auth.bot_token).toBe(REDACTED_SECRET);
+    // …but the plaintext was never produced: it is nowhere in what was sent.
+    expect(JSON.stringify(transport.sent[0])).not.toContain("123456:AAH-secret-token");
+    expect(JSON.stringify(transport.sent[0])).not.toContain(envelope);
+  });
+
   it("causes no real effect: the dry transport is the only thing that ran", async () => {
     // A transport that refuses to perform any live call, exactly so the test can
-    // prove the *caller* (not the code path) decides the effect.
+    // prove the *runtime* enforces the effectless path (and offers the request).
     class NoEffectTransport implements IntegrationTransport {
+      readonly kind = "dry-run" as const;
       readonly sent: RenderedRequest[] = [];
       send(request: RenderedRequest): Promise<TransportResponse> {
         this.sent.push(request);
