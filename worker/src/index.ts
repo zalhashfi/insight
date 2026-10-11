@@ -19,9 +19,15 @@
  *   POST /v1/events                                -> 204, or 400/401
  *   POST /v1/admin/projects/:proj/automations/:id/run -> 200 { "run": {...} }
  *   GET  /v1/public/dashboards/:token              -> 200 { "variables", "points" }
+ *   GET  /v1/mcp/read + POST /v1/mcp/write         -> 200 { "result" }, or 401/403
+ *   GET  /v1/mcp/oauth/.well-known/oauth-authorization-server + POST /v1/mcp/oauth/token
+ *   GET  /v1/integrations                          -> 200 { "providers": [...] }
+ *   POST /v1/integrations/test                     -> 200 { "result": {...} }, or 400/401
+ *   POST /v1/external/poll                         -> 200 { "ingested", "results" }, or 401
  *
  * The M3 routes are mounted **only** when the matching {@link BindingAdapters.m3}
- * group is supplied; an M1-only binding composes exactly the M1 surface.
+ * group is supplied; an M1-only binding composes exactly the M1 surface. The M4
+ * routes/hooks are likewise gated on {@link BindingAdapters.m4}.
  *
  * The `app` is exported so tests can exercise the composed surface in-process
  * via `app.request("/healthz")` without a running server; `fetch` is exposed on
@@ -66,6 +72,10 @@ import type { CredentialResolver } from "./domains/telemetry/query";
  *                       manual-run, public dashboard). Omit any group and its
  *                       route is not mounted; supply it and the route appears,
  *                       wired to the real seams the deploy holds.
+ *   - `m4`            — the optional M4 (AI-layer) seam groups: the MCP bridge
+ *                       (tools + gate + OAuth), the integrations egress surface,
+ *                       the anomaly notification hook and external polling.
+ *                       Same rule: an absent group leaves its surface absent.
  */
 export interface BindingAdapters {
   readonly deviceTokens: DeviceTokenResolver;
@@ -76,6 +86,13 @@ export interface BindingAdapters {
   readonly query: AppDeps["query"];
   /** Optional M3 seam groups; each mounts its own route group when present. */
   readonly m3?: AppDeps["m3"];
+  /**
+   * Optional M4 seam groups (the AI layer): the MCP bridge, the integrations
+   * egress surface, the anomaly notification hook and external polling. Each
+   * mounts/wires itself when present; omit a group and its surface is absent,
+   * exactly as for {@link BindingAdapters.m3}.
+   */
+  readonly m4?: AppDeps["m4"];
   /** Advertised build identity; defaults to the skeleton's `0.0.1`. */
   readonly version?: VersionInfo;
 }
@@ -103,6 +120,10 @@ export function buildDeps(adapters: BindingAdapters): AppDeps {
     // M3 groups are passed through verbatim; an absent group leaves its routes
     // unmounted, which is the honest state for a deploy that has not bound them.
     m3: adapters.m3,
+    // M4 groups likewise: a deploy that binds none composes exactly the M1–M3
+    // surface, and one that supplies a group gains its route/hook wired to the
+    // real seams it holds. Nothing here fabricates an AI-layer binding.
+    m4: adapters.m4,
     version: adapters.version,
   };
 }
