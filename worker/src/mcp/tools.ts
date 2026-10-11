@@ -1132,9 +1132,23 @@ export function createMcpTools(deps: McpToolDeps): McpTools {
   function readRequest(c: Context): { name: string; args: ToolArgs } {
     const url = new URL(c.req.url);
     const name = url.searchParams.get("tool") ?? "";
+    // A query string carries only strings, but a read tool may declare a numeric
+    // parameter (e.g. `get_series.windowMs`). Coerce by the DECLARED type so the
+    // documented GET surface accepts the parameter instead of rejecting every
+    // numeric arg as a non-number — the JSON write path already delivers real
+    // numbers and is left untouched.
+    const numeric = new Set(
+      (SPECS[name]?.params ?? []).filter((p) => p.type === "number").map((p) => p.name),
+    );
     const args: Record<string, unknown> = {};
     url.searchParams.forEach((value, key) => {
-      if (key !== "tool") args[key] = value;
+      if (key === "tool") return;
+      if (numeric.has(key)) {
+        const parsed = Number(value);
+        args[key] = Number.isFinite(parsed) ? parsed : value; // non-numeric → let the tool reject it
+      } else {
+        args[key] = value;
+      }
     });
     return { name, args };
   }

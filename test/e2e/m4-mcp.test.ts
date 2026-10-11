@@ -453,6 +453,33 @@ describe("M4 e2e — a standard MCP client reads and writes via the composed app
     const read = await h.app.request(`/v1/mcp/read?tool=get_state&projectId=${PROJECT}`);
     expect(read.status).toBe(401);
   });
+
+  it("accepts a NUMERIC read param (get_series.windowMs) over the GET query surface", async () => {
+    // Regression: `readRequest` once delivered every query value as a string, so
+    // `get_series`'s declared numeric `windowMs` was rejected as a non-number on
+    // the documented GET surface. A query string carries only strings, so the
+    // reader coerces by the DECLARED param type.
+    const h = harness();
+    const token = await exchangeFor(h, [READ_SCOPE]);
+
+    const withWindow = await gatedResult(
+      h.app,
+      `/v1/mcp/read?tool=get_series&projectId=${PROJECT}&variable=temp&windowMs=300`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    expect(withWindow.status).toBe(200);
+    expect(withWindow.envelope.ok).toBe(true);
+
+    // A non-numeric value for the same param is still refused (not silently
+    // coerced to a number), so the coercion cannot mask bad input.
+    const bad = await gatedResult(
+      h.app,
+      `/v1/mcp/read?tool=get_series&projectId=${PROJECT}&variable=temp&windowMs=soon`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    expect(bad.envelope.ok).toBe(false);
+    expect(bad.envelope.error).toBe("invalid_request");
+  });
 });
 
 // ===========================================================================
