@@ -17,7 +17,7 @@
  *   2. {@link FirmwareLookup} — D1's `firmware` table (the same
  *      `(projectId, version)` row the upload writes), so the route resolves a
  *      version to its `r2Key` without re-deriving it.
- *   3. {@link ImageQuota} — the per-device/hour budget (D2.8). The route asks
+ *   3. {@link ImageQuota} — the per-principal/hour budget (D2.8). The route asks
  *      it *before* it reads a single byte, so an over-quota request never
  *      touches the store.
  *
@@ -25,8 +25,8 @@
  *
  * The order is load-bearing and observable at the wire:
  *
- *   * **Quota first.** A device's hourly budget is charged before the bytes are
- *     fetched, so an exhausted device cannot use the route to probe the store
+ *   * **Quota first.** The principal's hourly budget is charged before the bytes are
+ *     fetched, so an exhausted principal cannot use the route to probe the store
  *     (or to burn bandwidth) — it gets `429` + `retry-after` and, crucially,
  *     **no body** (`Content-Length: 0`, zero bytes). A denied request is *free*:
  *     {@link ImageQuota.consume} is consulted exactly once and a denial records
@@ -62,6 +62,12 @@
 import type { Context } from "hono";
 import { Hono } from "hono";
 import { readBearerToken, type Principal } from "../../platform/middleware/resolve-project";
+import { imageQuotaKey } from "../../platform/quota/ota-quota";
+import {
+  DEFAULT_OTA_QUOTA_PER_HOUR,
+  OTA_QUOTA_WINDOW_MS,
+  type QuotaDecision,
+} from "../../platform/quota/ota-quota";
 
 // ---------------------------------------------------------------------------
 // Frozen wire constants (mirror test/contracts/ota-lock.ts — the tripwire)
@@ -89,21 +95,27 @@ export const IMAGE_RATE_LIMITED_CODE = "rate_limited" as const;
 export const IMAGE_NOT_FOUND_CODE = "not_found" as const;
 
 /**
- * Default quota: admitted image downloads per device per hour. Matches D2.8's
- * per-device/hour budget; injected so a test (or a deploy) can pin its own.
+ * Default quota: admitted image downloads per principal per hour.
+ *
+ * Re-exported from the ONE quota module (`platform/quota/ota-quota.ts`), so the
+ * DO path and this route cannot drift to two different numbers for the same
+ * hour.
  */
-export const DEFAULT_OTA_IMAGE_QUOTA_PER_HOUR = 60;
+export const DEFAULT_OTA_IMAGE_QUOTA_PER_HOUR = DEFAULT_OTA_QUOTA_PER_HOUR;
 
-/** One hour in milliseconds — the quota's window (D2.8). */
-export const OTA_IMAGE_QUOTA_WINDOW_MS = 60 * 60 * 1000;
+/** One hour in milliseconds — the quota's window (D2.8), from the one module. */
+export const OTA_IMAGE_QUOTA_WINDOW_MS = OTA_QUOTA_WINDOW_MS;
 
 /** Header naming the requesting device; mirrors the ingest and control routes. */
 export const DEVICE_HEADER = "x-insight-device";
 
 /**
- * Device key applied when {@link DEVICE_HEADER} is absent or blank. The
- * default is a single shared bucket, so a caller that omits identity cannot
- * escape the quota by being nameless.
+ * Device key applied when {@link DEVICE_HEADER} is absent or blank.
+ *
+ * NOTE: this header is used ONLY for the `ota_status`/`x-insight-device`
+ * reporting concern, **never** for the quota. The quota key is derived from the
+ * verified principal ({@link imageQuotaKey}), so a caller cannot mint a fresh
+ * budget by rotating this client-controlled header.
  */
 export const DEFAULT_DEVICE_KEY = "unknown";
 
@@ -153,99 +165,28 @@ export interface QuotaAllowed {
 }
 
 /** Discriminated outcome of {@link ImageQuota.consume}. */
-export type QuotaDecision = QuotaAllowed | QuotaExceeded;
+export type { QuotaDecision };
 
 /**
- * Per-device/hour quota seam (D2.8).
+ * Per-principal/hour quota seam (D2.8 / INV-O2).
  *
  * `consume` is consulted exactly once per request, *before* the image is read;
- * it charges the device's budget on admission and returns a denial (with a
- * `retry-after`) when the hour is spent. Production backs this with a
- * {@link WindowQuota} (a sliding window log keyed by device); a test can pass
- * any object with this one method.
+ * it charges the **principal's** budget on admission and returns a denial (with
+ * a `retry-after`) when the hour is spent.
+ *
+ * The key MUST be derived from the verified principal
+ * ({@link imageQuotaKey}), never from a request header: a header is
+ * client-controlled, so keying on it would let a caller rotate the value and
+ * obtain a fresh budget at will. The one implementation of this seam is
+ * {@link ../../platform/quota/ota-quota!MemoryOtaQuota} (in-memory) and the
+ * `ProjectControl.checkAndConsumeOtaQuota` adapter (DO-backed); both are the
+ * *same* algorithm — there is no second budget implementation here.
  */
 export interface ImageQuota {
-  consume(device: string): Promise<QuotaDecision>;
-}
-
-// ---------------------------------------------------------------------------
-// Window quota — the honest in-memory implementation
-// ---------------------------------------------------------------------------
-
-/** Construction options for {@link WindowQuota}. */
-export interface WindowQuotaOptions {
-  /** Admitted downloads per device per window. Defaults to the OTA default. */
-  readonly limit?: number;
-  /** Sliding window length in ms. Defaults to one hour ({@link OTA_IMAGE_QUOTA_WINDOW_MS}). */
-  readonly windowMs?: number;
-  /** Clock seam (epoch ms); defaults to `Date.now`, injected for determinism. */
-  readonly now?: () => number;
-}
-
-/**
- * Sliding-window-log quota keyed by device — one counter per device per hour.
- *
- * The same algorithm as `domains/telemetry/rate-limit.ts` (a pruned list of
- * admission timestamps), re-expressed here for a *device* key and an *async*
- * decision. It is deliberately keyed by "device and nothing else": the seam's
- * contract is that two devices never share a counter, so one device's flood
- * cannot throttle another — the acceptance property asserted by the suite.
- *
- * A denial records nothing (a denied request is free), and `retryAfter` is the
- * whole-second, rounded-up time until the oldest surviving sample leaves the
- * window — a valid, never-negative `retry-after`.
- */
-export class WindowQuota implements ImageQuota {
-  readonly #limit: number;
-  readonly #windowMs: number;
-  readonly #now: () => number;
-  readonly #samples = new Map<string, number[]>();
-
-  constructor(options: WindowQuotaOptions = {}) {
-    this.#limit = options.limit ?? DEFAULT_OTA_IMAGE_QUOTA_PER_HOUR;
-    this.#windowMs = options.windowMs ?? OTA_IMAGE_QUOTA_WINDOW_MS;
-    this.#now = options.now ?? (() => Date.now());
-  }
-
-  /** Remaining budget for `device` without consuming any (read-only). */
-  remaining(device: string): number {
-    const now = this.#now();
-    const live = this.#prune(this.#samples.get(device) ?? [], now).length;
-    return Math.max(0, this.#limit - live);
-  }
-
-  /** Drop all state for `device` (e.g. after a device is retired). */
-  reset(device: string): void {
-    this.#samples.delete(device);
-  }
-
-  /** {@link ImageQuota.consume}: allow-and-record, or deny with a retry hint. */
-  async consume(device: string): Promise<QuotaDecision> {
-    const now = this.#now();
-    const samples = this.#prune(this.#samples.get(device) ?? [], now);
-
-    if (samples.length >= this.#limit) {
-      // Denied — record nothing, so a retry during the burst cannot extend it.
-      const oldest = samples[0] ?? now;
-      const msUntilReset = Math.max(0, oldest + this.#windowMs - now);
-      const retryAfter = Math.max(1, Math.ceil(msUntilReset / 1000));
-      this.#samples.set(device, samples);
-      return { allowed: false, retryAfter };
-    }
-
-    samples.push(now);
-    this.#samples.set(device, samples);
-    return { allowed: true };
-  }
-
-  /** Drop samples at or before the window boundary; keep the list ascending. */
-  #prune(samples: number[], now: number): number[] {
-    const cutoff = now - this.#windowMs;
-    let i = 0;
-    while (i < samples.length && (samples[i] as number) <= cutoff) i += 1;
-    if (i > 0) samples.splice(0, i);
-    return samples;
-  }
+  /**
+   * Charge one unit to `key` (a principal key), or deny with a `retry-after`.
+   */
+  consume(key: string): Promise<QuotaDecision>;
 }
 
 // ---------------------------------------------------------------------------
@@ -337,7 +278,7 @@ async function authorise(c: Context, deps: ImageDeps): Promise<Principal | Respo
  *
  * Order, each step's failure mapped to the frozen status:
  *   1. auth                       → `401` (fail closed)
- *   2. quota (per device, per hour) → `429` + `retry-after`, **zero bytes**
+ *   2. quota (per principal, per hour) → `429` + `retry-after`, **zero bytes**
  *   3. the `(projectId, version)` row → `404`
  *   4. the object itself           → `404` when gone, else `200` octet-stream
  */
@@ -348,15 +289,17 @@ export function createImageHandler(deps: ImageDeps): ImageHandler {
     if (principal instanceof Response) return principal;
 
     const projectId = principal.projectId;
-    const device = (c.req.header(DEVICE_HEADER) ?? "").trim() || DEFAULT_DEVICE_KEY;
     const version = deps.version ?? (c.req.header(OTA_IMAGE_REQUEST_HEADER) ?? "").trim();
 
-    // 2. QUOTA — charged before the store is touched. A denial reads no bytes
-    //    and, keyed by device alone, never spends another device's budget. A
-    //    quota that throws is an unenforceable guard, so it fails closed to 429.
+    // 2. QUOTA — charged before the store is touched. The key is the VERIFIED
+    //    PRINCIPAL (token/user id), never the `x-insight-device` header: that
+    //    header is client-controlled, so keying on it would let a caller rotate
+    //    it and mint a fresh budget on every request. A quota that throws is an
+    //    unenforceable guard, so it fails closed to 429.
+    const quotaKey = imageQuotaKey(principal);
     let decision: QuotaDecision;
     try {
-      decision = await deps.quota.consume(device);
+      decision = await deps.quota.consume(quotaKey);
     } catch {
       decision = { allowed: false, retryAfter: 1 };
     }

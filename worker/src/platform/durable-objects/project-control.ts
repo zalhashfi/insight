@@ -51,6 +51,11 @@ import {
   projectControlStatements,
   type ControlStatus,
 } from "./project-control-schema";
+import {
+  OTA_QUOTA_WINDOW_MS,
+  decideOtaQuota,
+  type OtaQuotaRow,
+} from "../quota/ota-quota";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -60,7 +65,7 @@ import {
 export const DEFAULT_CONTROL_TTL_MS = 24 * 60 * 60 * 1000;
 
 /** The width of one OTA quota window: one hour, in milliseconds. */
-export const OTA_WINDOW_MS = 60 * 60 * 1000;
+export const OTA_WINDOW_MS = OTA_QUOTA_WINDOW_MS;
 
 // ---------------------------------------------------------------------------
 // Seams
@@ -290,25 +295,38 @@ export class ProjectControl {
     const now = this.clock();
     const stored = await this.storage.getOtaQuota(device);
 
-    // A window that has reached an hour in age has rolled; a fresh one opens.
-    const rolled = stored === null || now >= stored.windowStart + OTA_WINDOW_MS;
-    const windowStart = rolled ? now : stored.windowStart;
-    const used = rolled ? 0 : stored.used;
+    // The ONE budget algorithm (D2.8), shared with the OTA image route so the
+    // two can never disagree on a window boundary or a limit. This method is
+    // now only the persistence adapter: it loads the row, asks the pure core,
+    // and writes the row the decision returned.
+    const decision = decideOtaQuota(
+      stored === null ? null : { key: device, windowStart: stored.windowStart, used: stored.used },
+      now,
+      limitPerHour,
+      device,
+    );
+    const row: OtaQuotaRow = decision.row;
 
-    if (used >= limitPerHour) {
-      await this.storage.putOtaQuota({ device, windowStart, used });
+    if (!decision.allowed) {
+      // Persist unchanged usage so a denied check does not burn budget, and the
+      // window stays pinned to where the budget was spent.
+      await this.storage.putOtaQuota({ device: row.key, windowStart: row.windowStart, used: row.used });
       return {
         allowed: false,
         reason: "quota_exceeded",
-        used,
-        limitPerHour,
-        windowStart,
+        used: decision.used,
+        limitPerHour: decision.limitPerHour,
+        windowStart: decision.windowStart,
       };
     }
 
-    const next = used + 1;
-    await this.storage.putOtaQuota({ device, windowStart, used: next });
-    return { allowed: true, used: next, limitPerHour, windowStart };
+    await this.storage.putOtaQuota({ device: row.key, windowStart: row.windowStart, used: row.used });
+    return {
+      allowed: true,
+      used: decision.used,
+      limitPerHour: decision.limitPerHour,
+      windowStart: decision.windowStart,
+    };
   }
 }
 

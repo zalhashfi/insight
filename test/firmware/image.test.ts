@@ -28,7 +28,6 @@ import {
   OTA_IMAGE_CONTENT_TYPE,
   OTA_IMAGE_QUOTA_WINDOW_MS,
   RETRY_AFTER_HEADER,
-  WindowQuota,
   createImageHandler,
   type FirmwareLookup,
   type ImageDeps,
@@ -43,11 +42,14 @@ import {
 } from "../../worker/src/domains/firmware/upload";
 // The FROZEN cross-repo contract lock — the tripwire this suite asserts against.
 import { OTA_IMAGE } from "../contracts/ota-lock";
+import { MemoryOtaQuota } from "../../worker/src/platform/quota/ota-quota";
 import { CONTRACT_HEADERS } from "../contracts/contract-lock";
 
 const PROJECT = "proj_ota";
 const VERSION = "1.2.0";
 const TOKEN = "pt_live_ota";
+/** A SECOND real credential on the same project — its own OTA budget. */
+const OTHER_TOKEN = "pt_live_ota_2";
 const DEVICE_A = "dev_alpha";
 const DEVICE_B = "dev_beta";
 const FIRMWARE_HEADER = CONTRACT_HEADERS.firmware; // "x-insight-firmware"
@@ -69,7 +71,7 @@ interface Harness {
   readonly store: InMemoryImageStore;
   readonly repo: InMemoryFirmwareRepo;
   readonly clock: { now: number };
-  readonly quota: WindowQuota;
+  readonly quota: MemoryOtaQuota;
   readonly deps: ImageDeps;
 }
 
@@ -93,15 +95,23 @@ function setup(options: { quotaLimit?: number; clock?: { now: number } } = {}): 
       return row === null ? null : row.r2Key;
     },
   };
-  const quota = new WindowQuota({
+  const quota = new MemoryOtaQuota({
     limit: options.quotaLimit ?? 2,
     windowMs: OTA_IMAGE_QUOTA_WINDOW_MS,
     now: () => clock.now,
   });
-  const verifyToken: VerifyImageToken = async (token) =>
-    token === TOKEN
-      ? { kind: "device", projectId: PROJECT, tokenId: "tok_ota", scopes: "read write" }
-      : null;
+  // Two DISTINCT credentials on one project: the quota is keyed by the
+  // principal, so each token carries its own budget while a rotated
+  // x-insight-device header does not.
+  const verifyToken: VerifyImageToken = async (token) => {
+    if (token === TOKEN) {
+      return { kind: "device", projectId: PROJECT, tokenId: "tok_ota", scopes: "read write" };
+    }
+    if (token === OTHER_TOKEN) {
+      return { kind: "device", projectId: PROJECT, tokenId: "tok_ota_2", scopes: "read write" };
+    }
+    return null;
+  };
 
   const deps: ImageDeps = { images, firmware, quota, verifyToken };
   const app = createOtaImage(deps);
@@ -350,22 +360,38 @@ describe("GET /v1/ota/image — a missing image", () => {
 });
 
 // ---------------------------------------------------------------------------
-// 4. Quota counts per device, per hour (independent devices), and rolls
+// 4. Quota is keyed by the PRINCIPAL, per hour (rotating the header is free of
+//    consequence), and the window rolls
 // ---------------------------------------------------------------------------
-describe("GET /v1/ota/image — quota is per device per hour", () => {
-  it("counts each device independently: one device's flood cannot throttle another", async () => {
+describe("GET /v1/ota/image — quota is keyed by the principal per hour", () => {
+  it("rotating x-insight-device does NOT grant a fresh budget", async () => {
+    // The blocker this pins: the budget follows the *credential*, not a
+    // client-supplied header, so a caller cannot mint budget by varying the
+    // device name on every request.
     const harness = setup({ quotaLimit: 2 });
     await seedImage(harness, VERSION, image(64));
 
-    // Device A exhausts its own budget…
+    // Two requests under two DIFFERENT device names, but ONE token.
+    expect((await request(harness, DEVICE_A, VERSION)).status).toBe(200);
+    expect((await request(harness, "dev_rotated", VERSION)).status).toBe(200);
+
+    // The third — under yet another name — is exhausted: the header is not the key.
+    expect((await request(harness, "dev_rotated_again", VERSION)).status).toBe(429);
+  });
+
+  it("counts each credential independently: one token's flood cannot throttle another", async () => {
+    const harness = setup({ quotaLimit: 2 });
+    await seedImage(harness, VERSION, image(64));
+
+    // Token A exhausts its own budget…
     for (let i = 0; i < 3; i += 1) await request(harness, DEVICE_A, VERSION);
     expect((await request(harness, DEVICE_A, VERSION)).status).toBe(429);
 
-    // …while device B's counter is untouched: it still has its full budget.
-    expect(harness.quota.remaining(DEVICE_B)).toBe(2);
-    expect((await request(harness, DEVICE_B, VERSION)).status).toBe(200);
-    expect((await request(harness, DEVICE_B, VERSION)).status).toBe(200);
-    expect((await request(harness, DEVICE_B, VERSION)).status).toBe(429);
+    // …while token B's counter is untouched: it still has its full budget.
+    expect(harness.quota.remaining("token:tok_ota_2")).toBe(2);
+    expect((await request(harness, DEVICE_B, VERSION, OTHER_TOKEN)).status).toBe(200);
+    expect((await request(harness, DEVICE_B, VERSION, OTHER_TOKEN)).status).toBe(200);
+    expect((await request(harness, DEVICE_B, VERSION, OTHER_TOKEN)).status).toBe(429);
   });
 
   it("admits again once the one-hour window has rolled", async () => {
@@ -376,21 +402,21 @@ describe("GET /v1/ota/image — quota is per device per hour", () => {
     expect((await request(harness, DEVICE_A, VERSION)).status).toBe(200);
     expect((await request(harness, DEVICE_A, VERSION)).status).toBe(429);
 
-    // One hour later (exactly the window) the oldest sample has left: admitted.
+    // One hour later (exactly the window) the budget is whole again.
     clock.now += OTA_IMAGE_QUOTA_WINDOW_MS;
     expect((await request(harness, DEVICE_A, VERSION)).status).toBe(200);
     // And its budget is spent again.
     expect((await request(harness, DEVICE_A, VERSION)).status).toBe(429);
   });
 
-  it("still admits a within-budget device while another is throttled", async () => {
+  it("still admits a within-budget credential while another is throttled", async () => {
     const harness = setup({ quotaLimit: 1 });
     await seedImage(harness, VERSION, image(64));
 
     expect((await request(harness, DEVICE_A, VERSION)).status).toBe(200);
     expect((await request(harness, DEVICE_A, VERSION)).status).toBe(429);
-    // A fresh device is served even though A is throttled.
-    const res = await request(harness, DEVICE_B, VERSION);
+    // A different credential is served even though the first is throttled.
+    const res = await request(harness, DEVICE_B, VERSION, OTHER_TOKEN);
     expect(res.status).toBe(200);
     expect(new Uint8Array(await res.arrayBuffer()).byteLength).toBe(64);
   });
@@ -404,10 +430,10 @@ describe("GET /v1/ota/image — quota is per device per hour", () => {
 // ---------------------------------------------------------------------------
 // 5. The quota seam itself — the window-log contract, in isolation
 // ---------------------------------------------------------------------------
-describe("WindowQuota — the per-device/hour seam", () => {
+describe("MemoryOtaQuota — the one per-principal/hour seam", () => {
   it("allows `limit` then denies with a positive whole-second retryAfter", async () => {
     let now = 1_700_000_000_000;
-    const quota = new WindowQuota({ limit: 2, now: () => now });
+    const quota = new MemoryOtaQuota({ limit: 2, now: () => now });
 
     expect((await quota.consume("d1")).allowed).toBe(true);
     expect((await quota.consume("d1")).allowed).toBe(true);
