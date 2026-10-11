@@ -31,9 +31,12 @@ import { DEFAULT_VERSION, createApp, type App, type AppDeps } from "../worker/sr
 import { InMemoryTokenRepo } from "../worker/src/domains/identity/tokens";
 import {
   InMemoryTelemetrySink,
+  type DeviceIngestibilityGate,
   type DeviceRegistry,
+  type IngestRateLimiter,
   type RecordedSample,
 } from "../worker/src/domains/telemetry/telemetry";
+import { RateLimiter, type RateLimitPolicy } from "../worker/src/domains/telemetry/rate-limit";
 import {
   InMemoryCredentials,
   InMemoryProjectLookup,
@@ -90,7 +93,12 @@ interface Harness {
  */
 async function harness(
   now = 1_700_000_000_000,
-  options: { scopes?: string | null } = {},
+  options: {
+    scopes?: string | null;
+    rateLimiter?: IngestRateLimiter;
+    rateLimit?: RateLimitPolicy;
+    ingestibility?: DeviceIngestibilityGate;
+  } = {},
 ): Promise<Harness> {
   // --- the credential store: hash-only, exactly like the D1 table -----------
   const tokens = new InMemoryTokenRepo();
@@ -186,6 +194,11 @@ async function harness(
       sink,
       devices,
       now: () => now,
+      // Optional seams, only set when a test asks for them, so the default
+      // harness exercises the app's own composition (default rate limiter).
+      ...(options.rateLimiter !== undefined ? { rateLimiter: options.rateLimiter } : {}),
+      ...(options.rateLimit !== undefined ? { rateLimit: options.rateLimit } : {}),
+      ...(options.ingestibility !== undefined ? { ingestibility: options.ingestibility } : {}),
     },
     query: {
       credentials: credentials.resolver,
@@ -407,6 +420,57 @@ describe("composed app: POST /v1/telemetry is mounted", () => {
     const body = (await res.json()) as { error?: string };
     expect(body.error).toBe("insufficient_scope");
     expect(h.sink.size).toBe(0);
+  });
+
+  it("the (limit+1)th ingest through the COMPOSED app is 429 + retry-after with zero writes", async () => {
+    // Proves the rate limiter is actually threaded into the mounted route, not
+    // just constructible: three ingests pass, the fourth is throttled.
+    const rateLimiter = new RateLimiter({ now: () => 1_700_000_000_000 });
+    const h = await harness(1_700_000_000_000, {
+      rateLimiter,
+      rateLimit: { limit: 3, windowMs: 60_000 },
+    });
+    const headers = { authorization: `Bearer ${TOKEN}`, "x-insight-device": DEVICE };
+
+    for (let i = 0; i < 3; i += 1) {
+      expect((await post(h.app, "/v1/telemetry", { metrics: { temp: i } }, headers)).status).toBe(204);
+    }
+    expect(h.sink.size).toBe(3);
+
+    const denied = await post(h.app, "/v1/telemetry", { metrics: { temp: 9 } }, headers);
+    expect(denied.status).toBe(429);
+    const body = (await denied.json()) as { error?: string };
+    expect(body.error).toBe("rate_limited");
+    expect(Number(denied.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+    expect(h.sink.size).toBe(3); // nothing written by the throttled request
+  });
+
+  it("a retired device is refused 403 device_not_ingestible through the COMPOSED app", async () => {
+    const h = await harness(1_700_000_000_000, {
+      ingestibility: { status: (p, d) => (p === PROJECT && d === "dev-retired" ? "retired" : undefined) },
+    });
+    const headers = { authorization: `Bearer ${TOKEN}` };
+
+    const refused = await post(
+      h.app,
+      "/v1/telemetry",
+      { metrics: { temp: 1 } },
+      { ...headers, "x-insight-device": "dev-retired" },
+    );
+    expect(refused.status).toBe(403);
+    const body = (await refused.json()) as { error?: string };
+    expect(body.error).toBe("device_not_ingestible");
+    expect(h.sink.size).toBe(0);
+
+    // A different (active/unknown) device with the SAME credential writes fine.
+    const accepted = await post(
+      h.app,
+      "/v1/telemetry",
+      { metrics: { temp: 2 } },
+      { ...headers, "x-insight-device": "dev-active" },
+    );
+    expect(accepted.status).toBe(204);
+    expect(h.sink.samples().map((s) => s.device)).toEqual(["dev-active"]);
   });
 });
 

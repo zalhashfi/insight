@@ -71,10 +71,13 @@
 import { Hono } from "hono";
 import {
   createTelemetryIngest,
+  type DeviceIngestibilityGate,
   type DeviceRegistry,
+  type IngestRateLimiter,
   type TelemetrySink,
   type VerifyToken,
 } from "./domains/telemetry/telemetry";
+import { defaultRateLimiter, type RateLimitPolicy } from "./domains/telemetry/rate-limit";
 import type { TelemetryLimits } from "./shared/validation";
 import {
   createTelemetryQuery,
@@ -138,6 +141,21 @@ export interface AppDeps {
     readonly verifyToken: VerifyToken;
     readonly sink: TelemetrySink;
     readonly devices: DeviceRegistry;
+    /**
+     * Per-token ingress rate limiter. Optional here (a caller may inject one
+     * or rely on {@link createApp}'s default), consulted after auth+scope and
+     * before device ingressibility; a denial is `429` + `retry-after`.
+     */
+    readonly rateLimiter?: IngestRateLimiter;
+    /** Rate-limit policy `(limit, windowMs)`; the route default applies if omitted. */
+    readonly rateLimit?: RateLimitPolicy;
+    /**
+     * Device lifecycle gate (INV-DEV-status). Optional: when omitted the route
+     * treats every device as ingestible. Production injects a `devices`-backed
+     * gate so a `retired`/`dormant` device is refused `403
+     * device_not_ingestible` and only `active`/unknown devices write.
+     */
+    readonly ingestibility?: DeviceIngestibilityGate;
     /** Server clock — the ONLY source of a record's timestamp. */
     readonly now?: () => number;
     /** Validation limits, forwarded verbatim to the shared validator. */
@@ -233,6 +251,12 @@ export function createApp(deps: AppDeps): App {
     "/v1/telemetry",
     createTelemetryIngest({
       ...deps.ingest,
+      // A rate limiter is always in force: the caller may inject one, otherwise
+      // the process-wide default (one shared sliding-window log) is used. The
+      // route keys it by the presented token and applies `rateLimit` (or the
+      // route's own default policy), so limiting is on by default rather than
+      // silently absent when a deploy forgets the seam.
+      rateLimiter: deps.ingest.rateLimiter ?? defaultRateLimiter,
       verifyToken: async (presented, c) => {
         const principal = await resolveIngestDevice(presented);
         if (principal?.kind === "device") {

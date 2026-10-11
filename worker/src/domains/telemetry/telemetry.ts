@@ -22,6 +22,16 @@
  *      credential that authenticates but lacks `write` (e.g. a `read`-scoped
  *      device token) -> `403`. One credential parser and one scope gate are
  *      shared with the admin routes.
+ *   1c. **Rate limit** — the presented token has a budget, enforced through an
+ *      injected {@link IngestRateLimiter} ({@link RateLimiter} in production,
+ *      keyed by the token). Over budget -> `429 rate_limited` with the
+ *      limiter's own `retry-after` header, and the request stops here (the body
+ *      is never read, nothing is written).
+ *   1d. **Device ingestibility** — INV-DEV-status, enforced through an injected
+ *      {@link DeviceIngestibilityGate} (the `devices` registry in production).
+ *      A device KNOWN to be `dormant`/`retired` -> `403 device_not_ingestible`;
+ *      an UNKNOWN device is admitted and auto-registered `active` below. This
+ *      runs before validation, so a retired device's payload is never parsed.
  *   2. **Server-stamped time** — every accepted record is stamped with the
  *      *server's* clock (the injected `now` seam). Any device-supplied `ts`,
  *      `time` or `timestamp` field is IGNORED for ordering, so a device with a
@@ -66,6 +76,33 @@ import {
   type ValidTelemetry,
   type ValidationResult,
 } from "../../shared/validation";
+import {
+  rateLimitedBody,
+  type RateLimitDecision,
+  type RateLimitPolicy,
+} from "./rate-limit";
+
+// ---------------------------------------------------------------------------
+// Ingress-gate constants (mirror the device + contract vocabularies)
+// ---------------------------------------------------------------------------
+
+/** Device lifecycle statuses that may NOT ingest (see `domains/devices`). */
+export const INGEST_REFUSED_STATUSES: readonly string[] = ["dormant", "retired"];
+
+/** Lifecycle status assumed for a device the registry does not know yet. */
+export const DEFAULT_DEVICE_STATUS = "active";
+
+/** Frozen error code for a device that may not ingest (INV-DEV-status). */
+export const DEVICE_NOT_INGESTIBLE_CODE = "device_not_ingestible" as const;
+
+/** Status carrying {@link DEVICE_NOT_INGESTIBLE_CODE} (spec §6.9). */
+export const DEVICE_NOT_INGESTIBLE_STATUS = 403 as const;
+
+/** Body of the `403` a non-ingestible device receives. */
+export interface DeviceNotIngestibleBody {
+  error: typeof DEVICE_NOT_INGESTIBLE_CODE;
+  message: string;
+}
 
 // ---------------------------------------------------------------------------
 // Seams
@@ -132,6 +169,44 @@ export interface DeviceRegistry {
   has?(projectId: string, device: string): Promise<boolean> | boolean;
 }
 
+/**
+ * Rate-limiter seam for the ingest route.
+ *
+ * A structural subset of `RateLimiter` from `./rate-limit`, named here (rather
+ * than importing the concrete class as the type) so a test can hand in a plain
+ * object or a different implementation and the route still composes. The
+ * `RateLimiter` class satisfies this shape as-is.
+ *
+ * The route keys the limiter by the **presented project token** — the same
+ * opaque string the verifier consumed — so a token's budget is per-credential
+ * and never shared across tenants.
+ */
+export interface IngestRateLimiter {
+  /**
+   * May the holder of `key` proceed? Consumes one unit of budget on success.
+   * `limit` / `windowMs` are supplied by the caller so the limiter instance
+   * holds no policy.
+   */
+  checkAndConsume(key: string, limit: number, windowMs: number): RateLimitDecision;
+}
+
+/**
+ * Device-ingestibility seam for the ingest route.
+ *
+ * Answers the ONE question the gate needs: what lifecycle status does this
+ * device currently hold for this project? Production backs it with the `devices`
+ * table / registry (`domains/devices/metadata.ts`); tests drive a stub.
+ *
+ * Returning `undefined` (or `null`) means "unknown device". The route's policy
+ * for an unknown device is **auto-register as {@link DEFAULT_DEVICE_STATUS}
+ * (`active`)** — a first sighting is admitted, matching the route's existing
+ * auto-registration behaviour. A known-but-refused status (`dormant` /
+ * `retired`) is answered `403 device_not_ingestible`, and nothing is written.
+ */
+export interface DeviceIngestibilityGate {
+  status(projectId: string, device: string): Promise<string | null | undefined> | string | null | undefined;
+}
+
 /** Everything the route needs, injectable end-to-end for tests. */
 export interface TelemetryDeps {
   /**
@@ -145,6 +220,28 @@ export interface TelemetryDeps {
   readonly sink: TelemetrySink;
   /** First-sighting device registration. */
   readonly devices: DeviceRegistry;
+  /**
+   * Per-token ingress rate limiter (see {@link IngestRateLimiter}).
+   *
+   * Optional so the standalone route keeps working without one; when provided
+   * it is consulted AFTER auth+scope and BEFORE device ingressibility, keyed by
+   * the presented token, and a denial is `429` + `retry-after` with zero sink
+   * writes. `rateLimit` absent, or `rateLimit.limit <= 0`, disables limiting.
+   */
+  readonly rateLimiter?: IngestRateLimiter;
+  /**
+   * Rate-limit policy `(limit, windowMs)`. Defaults to {@link DEFAULT_RATE_LIMIT},
+   * so a limiter can be injected with policy left to the route.
+   */
+  readonly rateLimit?: RateLimitPolicy;
+  /**
+   * Device lifecycle gate (see {@link DeviceIngestibilityGate}). Optional: when
+   * absent every device is treated as ingestible, preserving the pre-gate
+   * behaviour for a route composed without the `devices` binding. When present,
+   * a `dormant` / `retired` device is refused `403 device_not_ingestible`, and
+   * an unknown device is admitted (auto-registered active).
+   */
+  readonly ingestibility?: DeviceIngestibilityGate;
   /** Server clock seam; the ONLY source of a record's timestamp. */
   readonly now?: Clock;
   /** Validation limits forwarded verbatim to the shared module. */
@@ -175,6 +272,13 @@ export const MAX_DEVICE_KEY_LENGTH = 128;
 
 /** Default wall clock: Unix epoch milliseconds. */
 const defaultClock: Clock = () => Date.now();
+
+/**
+ * Default rate-limit policy when a {@link IngestRateLimiter} is injected but no
+ * `rateLimit` is supplied: `limit` requests per `windowMs` per presented token.
+ * Generous enough to be a safety net, not a throttle, for a normal device.
+ */
+export const DEFAULT_RATE_LIMIT: RateLimitPolicy = { limit: 600, windowMs: 60_000 };
 
 /** Error body for every `401`; reason is deliberately not differentiated. */
 export interface UnauthorizedBody {
@@ -304,6 +408,9 @@ export type TelemetryHandler = (c: Context) => Promise<Response>;
  * Failure mapping, in the order the checks run:
  *   * no/invalid token            -> `401` (missing/malformed/unknown)
  *   * authentic but no `write`    -> `403` (shared `requireScope` gate)
+ *   * over the token's budget     -> `429` (`rate_limited` + `retry-after`)
+ *   * a known, non-ingestible
+ *     (`dormant`/`retired`) device-> `403 device_not_ingestible`
  *   * shared validation failure   -> that result's own `400` / `413`
  *   * otherwise                   -> persist, then `204`
  */
@@ -311,6 +418,7 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
   const now = deps.now ?? defaultClock;
   const limits = deps.limits ?? DEFAULT_LIMITS;
   const defaultDevice = deps.defaultDevice ?? DEFAULT_DEVICE_KEY;
+  const rateLimit = deps.rateLimit ?? DEFAULT_RATE_LIMIT;
 
   return async function telemetryIngestHandler(c: Context): Promise<Response> {
     // 1. AUTH — before touching the body, so unauthenticated payloads are never
@@ -338,6 +446,19 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
     const refused = requireScope(c, "write");
     if (refused !== null) return refused;
 
+    // 1c. RATE LIMIT — a valid, write-scoped token still has a budget. Keyed by
+    //     the PRESENTED token (the same opaque string the verifier consumed), so
+    //     one token's flood cannot spend another's. A denial is `429` with the
+    //     limiter's own `retry-after` header and a frozen `rate_limited` body,
+    //     and — crucially — the route returns BEFORE reading the body, so a
+    //     throttled request does no work and writes nothing to the sink.
+    if (deps.rateLimiter !== undefined) {
+      const decision = deps.rateLimiter.checkAndConsume(token, rateLimit.limit, rateLimit.windowMs);
+      if (!decision.allowed) {
+        return c.json(rateLimitedBody(), decision.status, decision.headers);
+      }
+    }
+
     // 2. NORMALISE — FR-DEV-01/03 accept both `{ metrics: {...} }` and the
     //    `{ metric, value }` shorthand beside the canonical `{ metrics: [...] }`
     //    shape. Only a *shape* rewrite happens here; every size / key / value /
@@ -361,26 +482,48 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
       normalised = raw;
     }
 
-    // 3. VALIDATE — delegated wholesale to the shared module. This is the ONLY
+    // 3. DEVICE INGESTIBILITY (INV-DEV-status) — the lifecycle gate runs BEFORE
+    //    validation, so a retired/dormant device is refused without its payload
+    //    ever being parsed or measured (and, as with the limiter, with zero sink
+    //    writes). The device key is resolved here — from the same header step 5
+    //    reads — so the gate and the sink attribute to the identical key.
+    //
+    //    An UNKNOWN device (no status record yet) is admitted and will be
+    //    auto-registered `active` at step 5; only a device KNOWN to be
+    //    `dormant`/`retired` is refused `403 device_not_ingestible`. With no
+    //    `ingestibility` seam injected, every device is treated as ingestible.
+    const device = normaliseDevice(c.req.header(DEVICE_HEADER), defaultDevice);
+    const projectId = principal.projectId;
+    if (deps.ingestibility !== undefined) {
+      const status = await deps.ingestibility.status(projectId, device);
+      if (status !== null && status !== undefined && INGEST_REFUSED_STATUSES.includes(status)) {
+        const body: DeviceNotIngestibleBody = {
+          error: DEVICE_NOT_INGESTIBLE_CODE,
+          message: `device "${device}" is ${status} and may not ingest telemetry`,
+        };
+        return c.json(body, DEVICE_NOT_INGESTIBLE_STATUS);
+      }
+    }
+
+    // 4. VALIDATE — delegated wholesale to the shared module. This is the ONLY
     //    place per-metric rules are applied; this file adds none. A normalised
     //    object is already `{ metrics: ... }`; a raw string lets the shared
     //    module report its own invalid_json/empty-body verdict.
     const result: ValidationResult<ValidTelemetry> = validateTelemetry(normalised, limits);
     if (!result.ok) return errorResponse(c, result.status, result.code, result.message);
 
-    // 4. STAMP — server time is the sole timestamp. A device-supplied `ts`,
+    // 5. STAMP — server time is the sole timestamp. A device-supplied `ts`,
     //    `time` or `timestamp` is intentionally never read; `result.data`
     //    holds only validated `{key,value}` pairs, so device clocks cannot
-    //    influence ordering.
+    //    influence ordering. `device` and `projectId` were resolved for the
+    //    gate above and are reused here so the two agree by construction.
     const ts = now();
-    const device = normaliseDevice(c.req.header(DEVICE_HEADER), defaultDevice);
-    const projectId = principal.projectId;
 
-    // 5. AUTO-REGISTER — first sighting only, and never fatal. An already-known
+    // 6. AUTO-REGISTER — first sighting only, and never fatal. An already-known
     //    device (or a concurrent first sighting) is a no-op, not an error.
     await ensureDevice(deps.devices, projectId, device, ts);
 
-    // 6. PERSIST — one sink call per accepted metric carrying the server ts.
+    // 7. PERSIST — one sink call per accepted metric carrying the server ts.
     const data: ValidTelemetry = result.data;
     for (const metric of data.metrics) {
       await deps.sink.record(projectId, device, metric.key, metric.value, ts);

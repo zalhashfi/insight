@@ -20,6 +20,7 @@
 
 import { describe, expect, it } from "vitest";
 import { Hono } from "hono";
+import { createApp, type App, type AppDeps } from "../../worker/src/app";
 import {
   InMemoryDeviceRegistry,
   InMemoryTelemetrySink,
@@ -27,6 +28,7 @@ import {
   type TelemetryDeps,
 } from "../../worker/src/domains/telemetry/telemetry";
 import { postTelemetryValidated } from "../../worker/src/domains/telemetry/validate-route";
+import { RateLimiter } from "../../worker/src/domains/telemetry/rate-limit";
 import { AUTHORIZATION_HEADER } from "../../worker/src/domains/telemetry/query";
 import { DEFAULT_LIMITS } from "../../worker/src/shared/validation";
 import {
@@ -68,7 +70,7 @@ interface LiveTelemetry {
  * comes from the lock, so renaming the route in the lock makes the request
  * land on nothing and the status assertion fail.
  */
-function liveTelemetry(): LiveTelemetry {
+function liveTelemetry(overrides: Partial<TelemetryDeps> = {}): LiveTelemetry {
   const sink = new InMemoryTelemetrySink();
   const devices = new InMemoryDeviceRegistry();
   const deps: TelemetryDeps = {
@@ -77,6 +79,7 @@ function liveTelemetry(): LiveTelemetry {
     sink,
     devices,
     now: () => 1_700_000_000_000,
+    ...overrides,
   };
   const app = new Hono();
   app.route(POST_TELEMETRY.path, createTelemetryIngest(deps));
@@ -114,6 +117,36 @@ async function jsonOrUndefined(res: Response): Promise<Record<string, unknown> |
   const text = await res.text();
   if (text === "") return undefined;
   return JSON.parse(text) as Record<string, unknown>;
+}
+
+/**
+ * The REAL composed production surface, wired with in-memory seams.
+ *
+ * Used only by the absence probes: they must run against `createApp` (the app
+ * that actually mounts the middleware and routers), NOT a bare `new Hono()`.
+ * A bare Hono has no routes at all, so it 404s every path and could never
+ * notice a pending route being wired; `createApp(fakeDeps())` 404s *only* the
+ * paths it does not mount, so a future `/v1/ota` (or `/v1/control`) handler
+ * appearing in `worker/src/app.ts` turns the probe non-404 and FAILS.
+ */
+function composedApp(): App {
+  const deps: AppDeps = {
+    // Denies every credential, so no route under test is ever reached and no
+    // real store is required; the probes care only about ROUTING, not auth.
+    deviceTokens: async () => null,
+    sessions: async () => null,
+    ingest: {
+      verifyToken: async () => null,
+      sink: { record: async () => undefined },
+      devices: { register: () => undefined, has: () => false },
+    },
+    query: {
+      credentials: async () => null,
+      projects: { state: async () => [] },
+      shards: { ring: async () => [] },
+    },
+  };
+  return createApp(deps);
 }
 
 // ---------------------------------------------------------------------------
@@ -197,6 +230,10 @@ describe("contract-lock self-consistency", () => {
 
   it("marks which shapes the server actually implements today", () => {
     expect(POST_TELEMETRY.implemented).toBe(true);
+    // `rate_limited` is LIVE: the ingest route now returns 429 + retry-after,
+    // so the flag that once marked it shape-only (M3/A18) is flipped true. The
+    // SDK mirror must agree (see mirror.test.ts).
+    expect(CONTRACT_ERRORS.rate_limited.implemented).toBe(true);
     expect(GET_OTA.implemented).toBe(false); // M3 / A18
     expect(GET_CONTROL.implemented).toBe(false);
     expect(POST_CONTROL_ACK.implemented).toBe(false);
@@ -354,6 +391,43 @@ describe("POST /v1/telemetry (live ingest route)", () => {
       VALIDATION_PRIORITY.indexOf("invalid_key"),
     );
   });
+
+  it("returns STATUS.tooManyRequests with the frozen rate_limited body + retry-after", async () => {
+    // The route is rate-limited through an injected limiter; the (limit+1)th
+    // ingest must be the frozen `429` shape the lock names, not a bespoke one.
+    const rateLimiter = new RateLimiter({ now: () => 1_700_000_000_000 });
+    const { app, sink } = liveTelemetry({
+      rateLimiter,
+      rateLimit: { limit: 1, windowMs: 60_000 },
+    });
+
+    expect((await post(app, deviceHeaders("dev-1"), { metrics: { temp: 1 } })).status).toBe(
+      STATUS.noContent,
+    );
+
+    const res = await post(app, deviceHeaders("dev-1"), { metrics: { temp: 2 } });
+    expect(res.status).toBe(STATUS.tooManyRequests);
+    expect(res.status).toBe(CONTRACT_ERRORS.rate_limited.status);
+
+    const parsed = await jsonOrUndefined(res);
+    expect(Object.keys(parsed!).sort()).toEqual([...ERROR_BODY_FIELDS].sort());
+    expect(parsed![ERROR_BODY_FIELDS[0]]).toBe("rate_limited");
+    // retry-after is a positive whole-second value, as the SDK expects.
+    expect(Number(res.headers.get("retry-after"))).toBeGreaterThanOrEqual(1);
+    expect(sink.size).toBe(1); // the throttled request wrote nothing
+  });
+
+  it("refuses a retired device with 403 device_not_ingestible and writes nothing", async () => {
+    const { app, sink } = liveTelemetry({
+      ingestibility: { status: (p, d) => (d === "dev-retired" ? "retired" : undefined) },
+    });
+    const res = await post(app, deviceHeaders("dev-retired"), { metrics: { temp: 1 } });
+
+    expect(res.status).toBe(403);
+    const parsed = await jsonOrUndefined(res);
+    expect(parsed![ERROR_BODY_FIELDS[0]]).toBe("device_not_ingestible");
+    expect(sink.size).toBe(0);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -380,11 +454,28 @@ describe("POST /v1/telemetry (validation-only route)", () => {
 // ---------------------------------------------------------------------------
 
 describe("not-yet-implemented surfaces (M3 / A18)", () => {
+  // Probes below drive the REAL composed app, never a bare `new Hono()`. A bare
+  // Hono 404s every path unconditionally, so it would pass even if these routes
+  // were wired; `createApp(fakeDeps)` mounts the real middleware + routers, so
+  // a wired `/v1/ota` (or control) route makes the probe non-404 and fails.
+  const app = composedApp();
+
+  it("POST /v1/telemetry IS wired, so the composed app is not a blanket 404", async () => {
+    // A control: this route exists, and its module-owned auth answers `401`
+    // (not `404`) for an unauthenticated request. It proves the app routes
+    // requests, so the 404s below are about the pending surfaces being unwired.
+    const res = await app.request(POST_TELEMETRY.path, {
+      method: POST_TELEMETRY.method,
+      headers: { "content-type": "application/json" },
+      body: "{}",
+    });
+    expect(res.status).toBe(STATUS.unauthorized);
+  });
+
   it("GET /v1/ota has no live route yet", async () => {
     expect(GET_OTA.implemented).toBe(false);
-    const app = new Hono();
     const res = await app.request(GET_OTA.path, {
-      method: "GET",
+      method: GET_OTA.method,
       headers: { [CONTRACT_HEADERS.authorization]: `Bearer ${TOKEN}` },
     });
     expect(res.status).toBe(STATUS.notFound);
@@ -392,16 +483,14 @@ describe("not-yet-implemented surfaces (M3 / A18)", () => {
 
   it("GET /v1/control has no live route yet", async () => {
     expect(GET_CONTROL.implemented).toBe(false);
-    const app = new Hono();
-    const res = await app.request(GET_CONTROL.path, { method: "GET" });
+    const res = await app.request(GET_CONTROL.path, { method: GET_CONTROL.method });
     expect(res.status).toBe(STATUS.notFound);
   });
 
   it("POST /v1/control/ack has no live route yet", async () => {
     expect(POST_CONTROL_ACK.implemented).toBe(false);
-    const app = new Hono();
     const res = await app.request(POST_CONTROL_ACK.path, {
-      method: "POST",
+      method: POST_CONTROL_ACK.method,
       headers: { "content-type": "application/json" },
       body: JSON.stringify({ [CONTROL_ACK_REQUEST_FIELDS[0]]: ["c_1"] }),
     });

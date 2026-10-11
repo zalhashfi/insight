@@ -119,6 +119,10 @@ function unboundDeps(): AppDeps {
       verifyToken: async () => null,
       sink: { record: async () => undefined },
       devices: { register: () => undefined, has: () => false },
+      // An unbound deploy has no device-status store, so nothing is known to be
+      // refused; the honest default is "treat unknown devices as ingestible"
+      // (they would be auto-registered `active`) rather than inventing a store.
+      ingestibility: { status: () => undefined },
     },
     query: {
       // Unbound stores read as unavailable; nothing is fabricated.

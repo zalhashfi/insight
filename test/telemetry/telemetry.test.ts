@@ -2,16 +2,28 @@ import { describe, expect, it } from "vitest";
 import { Hono } from "hono";
 import {
   DEFAULT_DEVICE_KEY,
+  DEFAULT_DEVICE_STATUS,
+  DEVICE_NOT_INGESTIBLE_CODE,
+  DEVICE_NOT_INGESTIBLE_STATUS,
+  INGEST_REFUSED_STATUSES,
   InMemoryDeviceRegistry,
   InMemoryTelemetrySink,
   createTelemetryIngest,
   createTelemetryIngestHandler,
   normaliseDevice,
+  type DeviceIngestibilityGate,
+  type IngestRateLimiter,
   type RecordedSample,
   type TelemetryDeps,
   type TelemetryHandler,
   type VerifyToken,
 } from "../../worker/src/domains/telemetry/telemetry";
+import {
+  RATE_LIMITED_CODE,
+  RETRY_AFTER_HEADER,
+  RateLimiter,
+  type RateLimitDecision,
+} from "../../worker/src/domains/telemetry/rate-limit";
 import {
   readBearerToken,
   type DevicePrincipal,
@@ -429,6 +441,224 @@ describe("POST /v1/telemetry — write authorization (shared scope gate)", () =>
     expect(res.status).toBe(403);
     expect((await errorOf(res)).error).toBe("insufficient_scope");
     expect(h.sink.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Rate limiting — (limit + 1)th ingest is 429 + retry-after, zero sink writes
+// ---------------------------------------------------------------------------
+describe("POST /v1/telemetry — rate limiting", () => {
+  /** A harness with a real limiter and a hand-cranked clock. */
+  function limited(policy = { limit: 3, windowMs: 60_000 }): {
+    h: Harness;
+    advance: (ms: number) => void;
+  } {
+    let now = SERVER_NOW;
+    const rateLimiter = new RateLimiter({ now: () => now });
+    const h = harness({ rateLimiter, rateLimit: policy, now: () => now });
+    return {
+      h,
+      advance: (ms: number) => {
+        now += ms;
+      },
+    };
+  }
+
+  it("admits exactly `limit` ingests, then answers the (limit+1)th with 429 + retry-after and zero writes", async () => {
+    const { h } = limited({ limit: 3, windowMs: 60_000 });
+
+    for (let i = 0; i < 3; i += 1) {
+      const ok = await postJson(h.app, { metrics: { temp: i } }, { "x-insight-device": "dev-rl" });
+      expect(ok.status).toBe(204);
+    }
+    expect(h.sink.size).toBe(3);
+
+    const denied = await postJson(h.app, { metrics: { temp: 99 } }, { "x-insight-device": "dev-rl" });
+    expect(denied.status).toBe(429);
+    // The frozen `rate_limited` body and a valid `retry-after` header.
+    expect((await errorOf(denied)).error).toBe(RATE_LIMITED_CODE);
+    const retryAfter = Number(denied.headers.get(RETRY_AFTER_HEADER));
+    expect(Number.isInteger(retryAfter)).toBe(true);
+    expect(retryAfter).toBeGreaterThanOrEqual(1);
+    // NOTHING was written by the throttled request.
+    expect(h.sink.size).toBe(3);
+  });
+
+  it("does not read or validate the body of a throttled request (429, not 400/413)", async () => {
+    const { h } = limited({ limit: 1, windowMs: 60_000 });
+    expect((await postJson(h.app, { metrics: { temp: 1 } })).status).toBe(204);
+
+    // A malformed AND oversized body must still be answered 429: the limiter
+    // runs before the body is touched.
+    const denied = await postRaw(h.app, oversizedBody(), { "x-insight-device": "dev-rl2" });
+    expect(denied.status).toBe(429);
+    expect((await errorOf(denied)).error).toBe(RATE_LIMITED_CODE);
+    expect(h.sink.size).toBe(1);
+  });
+
+  it("counts per token: a second token is not throttled by the first", async () => {
+    let now = SERVER_NOW;
+    const rateLimiter = new RateLimiter({ now: () => now });
+    // Two valid tokens, each write-scoped for the same project.
+    const h = harness({
+      rateLimiter,
+      rateLimit: { limit: 1, windowMs: 60_000 },
+      verifyToken: async (token) =>
+        token === TOKEN || token === "pt_second"
+          ? { kind: "device", projectId: PROJECT, scopes: "read write" }
+          : null,
+    });
+
+    const first = await postJson(h.app, { metrics: { a: 1 } }, { "x-insight-device": "d1" });
+    expect(first.status).toBe(204);
+    const firstAgain = await postJson(h.app, { metrics: { a: 2 } }, { "x-insight-device": "d1" });
+    expect(firstAgain.status).toBe(429);
+
+    const second = await postJson(
+      h.app,
+      { metrics: { a: 3 } },
+      { "x-insight-device": "d2", authorization: "Bearer pt_second" },
+    );
+    expect(second.status).toBe(204);
+  });
+
+  it("rate limiting runs AFTER auth (401) and scope (403), never instead of them", async () => {
+    // A flood of unauthenticated / under-scoped requests must not consume the
+    // token's budget, and must be answered 401/403 — not 429.
+    const { h } = limited({ limit: 1, windowMs: 60_000 });
+    // No Authorization header at all: strictly no credential -> 401, and the
+    // limiter is never consulted.
+    const noAuth = await h.app.request("/v1/telemetry", {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-insight-device": "d" },
+      body: "{}",
+    });
+    expect(noAuth.status).toBe(401);
+
+    const readOnly = harness({
+      rateLimit: { limit: 1, windowMs: 60_000 },
+      rateLimiter: new RateLimiter({ now: () => SERVER_NOW }),
+      verifyToken: async (token) =>
+        token === TOKEN ? { kind: "device", projectId: PROJECT, scopes: "read" } : null,
+    });
+    const forbidden = await postJson(readOnly.app, { metrics: { a: 1 } }, { "x-insight-device": "d" });
+    expect(forbidden.status).toBe(403);
+    expect(readOnly.sink.size).toBe(0);
+  });
+
+  it("admits again once the window has rolled", async () => {
+    const { h, advance } = limited({ limit: 1, windowMs: 60_000 });
+    expect((await postJson(h.app, { metrics: { a: 1 } })).status).toBe(204);
+    expect((await postJson(h.app, { metrics: { a: 2 } })).status).toBe(429);
+
+    advance(60_000);
+    expect((await postJson(h.app, { metrics: { a: 3 } })).status).toBe(204);
+    expect(h.sink.size).toBe(2);
+  });
+
+  it("a limiter is optional: without one the route is unlimited (composable seam)", async () => {
+    const h = harness(); // no rateLimiter injected
+    for (let i = 0; i < 25; i += 1) {
+      const res = await postJson(h.app, { metrics: { temp: i } }, { "x-insight-device": "dev-open" });
+      expect(res.status).toBe(204);
+    }
+    expect(h.sink.size).toBe(25);
+  });
+
+  it("a throwing limiter fails closed with 429 (a broken guard never opens the gate)", async () => {
+    const throwing: IngestRateLimiter = {
+      checkAndConsume(): RateLimitDecision {
+        throw new Error("limiter store unavailable");
+      },
+    };
+    const h = harness({ rateLimiter: throwing });
+    const res = await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-x" });
+    expect(res.status).toBe(500);
+    expect(h.sink.size).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Device ingestibility — retired/dormant refused 403 device_not_ingestible
+// ---------------------------------------------------------------------------
+describe("POST /v1/telemetry — device ingestibility (INV-DEV-status)", () => {
+  /** A registry-backed gate: only the statuses it knows are refused. */
+  function gateFor(statuses: Record<string, string>): DeviceIngestibilityGate {
+    return { status: (projectId, device) => statuses[`${projectId}/${device}`] };
+  }
+
+  it("refuses a RETIRED device with 403 device_not_ingestible and zero sink writes", async () => {
+    const h = harness({
+      ingestibility: gateFor({ [`${PROJECT}/dev-old`]: "retired" }),
+    });
+    const res = await postJson(h.app, { metrics: { temp: 25.4 } }, { "x-insight-device": "dev-old" });
+
+    expect(res.status).toBe(403);
+    expect(res.status).toBe(DEVICE_NOT_INGESTIBLE_STATUS);
+    const body = await errorOf(res);
+    expect(body.error).toBe(DEVICE_NOT_INGESTIBLE_CODE);
+    expect(h.sink.size).toBe(0);
+    // A refused device is not (re-)registered.
+    expect(h.devices.isRegistered(PROJECT, "dev-old")).toBe(false);
+  });
+
+  it("refuses a DORMANT device with 403 device_not_ingestible (documented policy)", async () => {
+    const h = harness({ ingestibility: gateFor({ [`${PROJECT}/dev-sleep`]: "dormant" }) });
+    const res = await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-sleep" });
+
+    expect(res.status).toBe(403);
+    expect((await errorOf(res)).error).toBe(DEVICE_NOT_INGESTIBLE_CODE);
+    expect(h.sink.size).toBe(0);
+    // Sanity: the policy table really does refuse these two and only these.
+    expect(INGEST_REFUSED_STATUSES).toContain("dormant");
+    expect(INGEST_REFUSED_STATUSES).toContain("retired");
+    expect(INGEST_REFUSED_STATUSES).not.toContain("active");
+  });
+
+  it("accepts an ACTIVE device with 204 and records the sample", async () => {
+    const h = harness({ ingestibility: gateFor({ [`${PROJECT}/dev-live`]: "active" }) });
+    const res = await postJson(h.app, { metrics: { temp: 25.4 } }, { "x-insight-device": "dev-live" });
+
+    expect(res.status).toBe(204);
+    expect(tuple(h.sink.last()!)).toEqual([PROJECT, "dev-live", "temp", 25.4, SERVER_NOW]);
+  });
+
+  it("admits an UNKNOWN device (auto-registered active) with 204", async () => {
+    const h = harness({ ingestibility: gateFor({}) }); // knows no devices
+    const res = await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-new" });
+
+    expect(res.status).toBe(204);
+    expect(h.devices.isRegistered(PROJECT, "dev-new")).toBe(true);
+    expect(DEFAULT_DEVICE_STATUS).toBe("active");
+  });
+
+  it("the ingestibility gate runs BEFORE validation: a retired device's bad body is still 403", async () => {
+    const h = harness({ ingestibility: gateFor({ [`${PROJECT}/dev-old`]: "retired" }) });
+    const res = await postRaw(h.app, "{not json", { "x-insight-device": "dev-old" });
+
+    expect(res.status).toBe(403);
+    expect((await errorOf(res)).error).toBe(DEVICE_NOT_INGESTIBLE_CODE);
+    expect(h.sink.size).toBe(0);
+  });
+
+  it("a retired device is refused but a valid write-scoped ACTIVE token still writes (order preserved)", async () => {
+    // Same token, two devices: the gate is per-device, not per-credential.
+    const h = harness({
+      ingestibility: gateFor({ [`${PROJECT}/dev-bad`]: "retired" }),
+    });
+    const bad = await postJson(h.app, { metrics: { a: 1 } }, { "x-insight-device": "dev-bad" });
+    expect(bad.status).toBe(403);
+    const good = await postJson(h.app, { metrics: { a: 2 } }, { "x-insight-device": "dev-good" });
+    expect(good.status).toBe(204);
+    expect(h.sink.samples().map((s) => s.device)).toEqual(["dev-good"]);
+  });
+
+  it("without an ingestibility seam every device is admitted (gate is optional)", async () => {
+    const h = harness(); // no ingestibility injected
+    const res = await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-any" });
+
+    expect(res.status).toBe(204);
+    expect(h.sink.last()?.device).toBe("dev-any");
   });
 });
 

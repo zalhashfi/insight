@@ -88,8 +88,8 @@ export const CONTRACT_ERRORS = {
   too_many_metrics: { status: STATUS.payloadTooLarge, implemented: true },
   payload_too_large: { status: STATUS.payloadTooLarge, implemented: true },
   unauthorized: { status: STATUS.unauthorized, implemented: true },
-  // --- spec-frozen, route not wired yet (not invented) -------------------
-  rate_limited: { status: STATUS.tooManyRequests, implemented: false },
+  // --- live today: rate limiting is wired into the telemetry ingest route ---
+  rate_limited: { status: STATUS.tooManyRequests, implemented: true },
 } as const;
 
 export type ErrorCode = keyof typeof CONTRACT_ERRORS;
