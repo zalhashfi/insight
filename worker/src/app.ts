@@ -44,25 +44,28 @@
  *   * `createTelemetryQuery(deps)` is a self-contained router mounted at
  *     `/v1/projects`, mapping `:proj` to the credential's project.
  *
- * ## Why `/v1/telemetry` sits behind the project middleware
+ * ## Why `/v1/telemetry` is route-authenticated, not gated
  *
  * The ingest route authenticates itself: `createTelemetryIngest` refuses an
  * absent credential with `401 { error: "unauthorized" }` *before* it reads the
  * body — the frozen contract the smoke test pins (`POST_TELEMETRY.errors` names
- * `unauthorized`, not the middleware's `missing_credential`). So the gate is
- * mounted on the ingest paths **without taking over that `401`**:
+ * `unauthorized`, not the middleware's `missing_credential`). The rule applies
+ * to a *presented* credential too: an unknown, revoked or expired token is the
+ * same `401 { error: "unauthorized" }`, never the middleware's
+ * `invalid_credential`.
  *
- *   * on the base path `/v1/telemetry`, the gate runs only when a credential is
- *     actually presented. With no credential the request falls through to the
- *     route, which answers it as the contract demands; with one, the gate
- *     resolves and pins the tenant first, and the route independently
- *     re-verifies and enforces the `write` scope.
- *   * on the `:proj` claim form `/v1/telemetry/:proj`, the gate is fully
- *     fail-closed — no credential is `401`, and a claim contradicting the
- *     credential is `403` — matching the read surface.
+ * Mounting a `resolveDeviceProject` gate on the ingest path would break that:
+ * on a rejected credential it would answer with the middleware's body before
+ * the route ever ran. So the gate is **not** mounted on `/v1/telemetry`, and
+ * the one-time `:proj` claim form is gone with it (the router only ever posts
+ * to the base path, so `/v1/telemetry/:proj` was dead — a 404, not a route).
  *
- * Either way the credential is verified twice with the same injected seam, so
- * the fold can only ever be *more* strict, never permissive.
+ * The tenant is still resolved from the device credential, exactly once and by
+ * the one seam the gate would have used: {@link createApp} wraps the route's
+ * `verifyToken` so the same lookup pins `principal`/`project` on the context.
+ * The wrapper records only — it makes no decision. The route keeps ownership of
+ * the `401` and keeps enforcing `requireScope(c, "write")` (so a `read`-scoped
+ * or scope-less token is `403`), and the read surface keeps its own gate.
  */
 
 import { Hono } from "hono";
@@ -81,7 +84,6 @@ import {
 } from "./domains/telemetry/query";
 import { securityHeaders } from "./platform/middleware/security-headers";
 import {
-  readBearerToken,
   resolveDeviceProject,
   type DeviceTokenResolver,
   type ResolveProjectVariables,
@@ -206,36 +208,46 @@ export function createApp(deps: AppDeps): App {
   const version = deps.version ?? DEFAULT_VERSION;
   app.get("/v1/version", (c) => c.json({ name: version.name, version: version.version }, 200));
 
-  // 3. Device ingress. The gate pins the tenant before the route runs, but the
-  //    base path stays *route-authenticated*: the frozen contract for
-  //    `POST /v1/telemetry` is the ingest route's own
-  //    `401 { error: "unauthorized" }` (see `POST_TELEMETRY.errors`), not the
-  //    middleware's `missing_credential`. So on the base path the gate runs
-  //    only when a credential is actually presented — an unauthenticated POST
-  //    falls through untouched and the route answers it, exactly as the
-  //    contract says. A presented credential is still resolved and pinned, and
-  //    the route independently re-verifies and enforces the `write` scope.
+  // 3. Device ingress. The ingest router is the single authority for every
+  //    ingest decision, including the credential verdict. The frozen contract
+  //    for `POST /v1/telemetry` (`POST_TELEMETRY.errors`) names `unauthorized`
+  //    — for a missing token AND for a presented-but-rejected one — and never
+  //    the middleware's `invalid_credential` / `missing_credential` codes.
   //
-  //    The `:proj` claim form is fully fail-closed (no credential => 401, a
-  //    claim contradicting the credential => 403), matching the read surface.
-  const ingestGate = resolveDeviceProject({
-    deviceTokens: deps.deviceTokens,
-    // Required by the middleware contract; never consulted on a device route
-    // (and never reached, because the gate denies first).
-    sessions: deps.sessions,
-  });
-  const projectsResolver = { deviceTokens: deps.deviceTokens, sessions: deps.sessions };
-
-  app.use("/v1/telemetry", (c, next) =>
-    // No credential at all: the route owns the 401 (its frozen body/code).
-    readBearerToken(c) === null ? next() : ingestGate(c, next),
+  //    Folding a `resolveDeviceProject` gate onto the base path would answer a
+  //    rejected credential with the middleware's body before the route ran, so
+  //    the gate is NOT mounted there. (The old dead `:proj` claim form —
+  //    `/v1/telemetry/:proj`, which the router never posts to — is gone too: an
+  //    unknown path now 404s at the framework edge rather than invoking a gate
+  //    whose route does not exist.)
+  //
+  //    The tenant is still resolved from the device credential — exactly once,
+  //    by the one seam the gate would have used — so `principal`/`project` are
+  //    pinned for the route. The wrapper only records; it makes no decision:
+  //    the route's own `verifyToken` still owns the `401`, and the route still
+  //    enforces `requireScope(c, "write")` (so a `read`-scoped or scope-less
+  //    token is `403`). Authenticating and authorizing stay with the module
+  //    that owns the wire contract.
+  const resolveIngestDevice = deps.deviceTokens;
+  app.route(
+    "/v1/telemetry",
+    createTelemetryIngest({
+      ...deps.ingest,
+      verifyToken: async (presented, c) => {
+        const principal = await resolveIngestDevice(presented);
+        if (principal?.kind === "device") {
+          c.set("principal", principal);
+          c.set("project", principal.projectId);
+        }
+        return deps.ingest.verifyToken(presented, c);
+      },
+    }),
   );
-  app.use("/v1/telemetry/:proj", ingestGate);
-  app.route("/v1/telemetry", createTelemetryIngest(deps.ingest));
 
   // 4. Read surface. The router owns `:proj`; the middleware is mounted on the
   //    sub-tree so a path claim that disagrees with the credential is refused
   //    fail-closed before any read.
+  const projectsResolver = { deviceTokens: deps.deviceTokens, sessions: deps.sessions };
   const projects = new Hono();
   projects.use("/:proj/*", resolveDeviceProject(projectsResolver));
   projects.route("/", createTelemetryQuery(deps.query));

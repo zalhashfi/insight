@@ -88,8 +88,17 @@ export type Clock = () => number;
  * usable" and the route answers `401` — the two are deliberately
  * indistinguishable to the client, so a caller cannot probe *why* a token
  * failed.
+ *
+ * The verifier is handed the request {@link Context} so a composing layer (the
+ * Worker's `createApp`) can record the resolved tenant — `principal` and
+ * `project` — on the request exactly once, from this one lookup, without
+ * mounting a second middleware. The verifier itself makes no decision on the
+ * context: it only returns the principal or `null`.
  */
-export type VerifyToken = (token: string) => Promise<Principal | null>;
+export type VerifyToken = (
+  token: string,
+  c: Context,
+) => Promise<Principal | null>;
 
 /**
  * Persistence seam for accepted telemetry.
@@ -313,7 +322,7 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
 
     let principal: Principal | null;
     try {
-      principal = await deps.verifyToken(token);
+      principal = await deps.verifyToken(token, c);
     } catch {
       // A throwing verifier is a refusal, not a 500: fail closed.
       principal = null;

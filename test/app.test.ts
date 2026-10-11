@@ -15,11 +15,14 @@
  *      success, `401` and `404` alike;
  *   2. `/healthz` is `200 { ok: true }`;
  *   3. `/v1/version` reports the advertised identity;
- *   4. the telemetry ingest route is MOUNTED: an unauthenticated
- *      `POST /v1/telemetry` (contract-locked `401`) is answered by the route,
- *      not by a 404;
- *   5. a valid project token flows all the way to the sink and is `204`;
- *   6. the `:proj` path claim is fail-closed against the credential.
+ *   4. the telemetry ingest route is MOUNTED and is the sole authority on the
+ *      ingest `401`: no credential, a non-Bearer credential, an unknown
+ *      credential and a REVOKED credential are all the frozen
+ *      `401 { error: "unauthorized" }` — never the middleware's
+ *      `invalid_credential`;
+ *   5. a valid project token flows all the way to the sink and is `204`, while
+ *      a `read`-scoped token is refused the write with `403`;
+ *   6. the read surface is fail-closed behind its own project gate.
  */
 
 import { describe, expect, it } from "vitest";
@@ -54,6 +57,12 @@ const DEVICE = "iot-sim-01";
 /** A realistic-looking opaque project token (characters only; the value is arbitrary). */
 const TOKEN = `${TOKEN_PREFIX}smoke_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`;
 const FOREIGN_TOKEN = `${TOKEN_PREFIX}smoke_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb`;
+/** A real, resolvable token that grants `read` only — never a write. */
+const READ_ONLY_TOKEN = `${TOKEN_PREFIX}smoke_rrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrrr`;
+/** A real, resolvable token that has been revoked — present but unusable. */
+const REVOKED_TOKEN = `${TOKEN_PREFIX}smoke_vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv`;
+/** Well-formed and presented, but never stored — resolvable to nothing. */
+const UNKNOWN_TOKEN = `${TOKEN_PREFIX}smoke_zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz`;
 
 const DEVICE_PRINCIPAL: DevicePrincipal = {
   kind: "device",
@@ -79,7 +88,10 @@ interface Harness {
  *   - the sink records every accepted `(projectId, device, metric, value, ts)`
  *     tuple, with `ts` from a pinned clock.
  */
-async function harness(now = 1_700_000_000_000): Promise<Harness> {
+async function harness(
+  now = 1_700_000_000_000,
+  options: { scopes?: string | null } = {},
+): Promise<Harness> {
   // --- the credential store: hash-only, exactly like the D1 table -----------
   const tokens = new InMemoryTokenRepo();
   await tokens.insert({
@@ -88,9 +100,43 @@ async function harness(now = 1_700_000_000_000): Promise<Harness> {
     name: "smoke token",
     tokenHash: await hashToken(TOKEN),
     tokenPrefix: TOKEN.slice(0, 6),
-    scopes: "read write",
+    // `null` mints a token with NO scope string — the least-privilege
+    // read-only default; omitted keeps the operational `read write` token.
+    scopes: options.scopes === null ? null : (options.scopes ?? "read write"),
     expiresAt: null,
     revokedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  // A second REAL token in the same project, but scoped `read` only: it
+  // authenticates (so ingest must not answer `401`) yet the write gate refuses
+  // it with `403`. This is the credential the acceptance criterion names.
+  await tokens.insert({
+    id: "tok_read_only",
+    projectId: PROJECT,
+    name: "read-only token",
+    tokenHash: await hashToken(READ_ONLY_TOKEN),
+    tokenPrefix: READ_ONLY_TOKEN.slice(0, 6),
+    scopes: "read",
+    expiresAt: null,
+    revokedAt: null,
+    createdAt: now,
+    updatedAt: now,
+  });
+
+  // A REVOKED token: stored, so it is a *presented* credential the verifier
+  // recognises and then rejects. Revocation must read as `unauthorized`, not
+  // as a leak of why (it is the same `401` an unknown token gets).
+  await tokens.insert({
+    id: "tok_revoked",
+    projectId: PROJECT,
+    name: "revoked token",
+    tokenHash: await hashToken(REVOKED_TOKEN),
+    tokenPrefix: REVOKED_TOKEN.slice(0, 6),
+    scopes: "read write",
+    expiresAt: null,
+    revokedAt: now,
     createdAt: now,
     updatedAt: now,
   });
@@ -290,13 +336,77 @@ describe("composed app: POST /v1/telemetry is mounted", () => {
     expect(registerCalls[0]).toMatchObject({ projectId: PROJECT, device: DEVICE });
   });
 
-  it("a :proj path claim contradicting the credential is refused (403)", async () => {
+  it("a presented-but-unknown Bearer is the frozen 401 unauthorized", async () => {
+    // The credential is PRESENTED and well-formed but resolves to nothing. The
+    // frozen contract names `unauthorized` here — the SAME code an absent
+    // credential gets — and emphatically not the middleware's
+    // `invalid_credential`. The route, not a gate, owns this verdict.
+    const { app, sink } = await harness();
+    const res = await post(app, "/v1/telemetry", { metrics: { temp: 25.4 } }, {
+      authorization: `Bearer ${UNKNOWN_TOKEN}`,
+    });
+    expect(res.status).toBe(401);
+    expect(res.status).not.toBe(404);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe("unauthorized");
+    expect(body.error).not.toBe("invalid_credential");
+    expect(sink.size).toBe(0); // fail-closed: nothing was written
+  });
+
+  it("a presented-but-revoked Bearer is also 401 unauthorized (not invalid_credential)", async () => {
+    // Revoked is a submitted credential the verifier recognises and rejects;
+    // it must read exactly like the unknown one — no oracle for *why*.
+    const { app, sink } = await harness();
+    const res = await post(app, "/v1/telemetry", { metrics: { temp: 25.4 } }, {
+      authorization: `Bearer ${REVOKED_TOKEN}`,
+    });
+    expect(res.status).toBe(401);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe("unauthorized");
+    expect(body.error).not.toBe("invalid_credential");
+    expect(sink.size).toBe(0);
+  });
+
+  it("a read-scoped Bearer authenticates but is refused the write (403)", async () => {
+    // A REAL token in the credential's own project, scoped `read` only: it is
+    // not a 401 (the route resolved it), and the shared `requireScope("write")`
+    // gate refuses it 403 so nothing is persisted.
+    const { app, sink } = await harness();
+    const res = await post(app, "/v1/telemetry", { metrics: { temp: 25.4 } }, {
+      authorization: `Bearer ${READ_ONLY_TOKEN}`,
+      "x-insight-device": DEVICE,
+    });
+    expect(res.status).toBe(403);
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe("insufficient_scope");
+    expect(sink.size).toBe(0);
+  });
+
+  it("the dead `:proj` ingest mount is gone (404, not a claim form)", async () => {
+    // `/v1/telemetry/:proj` never had a route behind it, so the claim form was
+    // dead wiring. It is removed: an unknown path 404s at the framework edge
+    // rather than running a gate whose route does not exist.
     const { app, sink } = await harness();
     const res = await post(app, `/v1/telemetry/${OTHER_PROJECT}`, { metrics: { temp: 1 } }, {
       authorization: `Bearer ${TOKEN}`,
     });
+    expect(res.status).toBe(404);
+    expect(sink.size).toBe(0);
+  });
+
+  it("a scope-less token is refused a write with 403 (least-privilege default)", async () => {
+    // The credential is minted with NO `scopes` field: the least-privilege
+    // default makes it read-only, so the composed ingest route — which gates
+    // with the shared `requireScope(c, "write")` — refuses it 403.
+    const h = await harness(1_700_000_000_000, { scopes: null });
+    const res = await post(h.app, "/v1/telemetry", { metrics: { temp: 1 } }, {
+      authorization: `Bearer ${TOKEN}`,
+      "x-insight-device": DEVICE,
+    });
     expect(res.status).toBe(403);
-    expect(sink.size).toBe(0); // fail-closed: nothing was written
+    const body = (await res.json()) as { error?: string };
+    expect(body.error).toBe("insufficient_scope");
+    expect(h.sink.size).toBe(0);
   });
 });
 
@@ -328,5 +438,21 @@ describe("composed app: GET /v1/projects/:proj/state", () => {
       headers: { authorization: `Bearer ${TOKEN}` },
     });
     expect(res.status).toBe(403);
+  });
+
+  it("a bare / scheme-less Authorization is 401 (shared STRICT parser)", async () => {
+    const { app } = await harness();
+    const res = await app.request(`/v1/projects/${PROJECT}/state`, {
+      headers: { authorization: TOKEN },
+    });
+    expect(res.status).toBe(401);
+  });
+
+  it("a non-Bearer scheme is 401 on the read surface", async () => {
+    const { app } = await harness();
+    const res = await app.request(`/v1/projects/${PROJECT}/variables/temp/series`, {
+      headers: { authorization: `Basic ${TOKEN}` },
+    });
+    expect(res.status).toBe(401);
   });
 });
