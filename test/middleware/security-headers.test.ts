@@ -101,7 +101,7 @@ describe("securityHeaders middleware", () => {
 
   it("emits each header exactly once (no duplicates)", async () => {
     const res = await makeApp().request("/ok");
-    const raw = Array.from(res.headers.entries());
+    const raw = Array.from(res.headers.entries()) as [string, string][];
     // `set` — not `append` — must be used, so each name appears once.
     for (const name of Object.keys(EXPECTED)) {
       const hits = raw.filter(([k]) => k.toLowerCase() === name.toLowerCase());

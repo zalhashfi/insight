@@ -6,12 +6,14 @@ import { parseSql, type SqlStatement } from "../../worker/src/platform/db/sql-sp
 // Workers + vitest, and this task may not touch it). Bun provides both at
 // runtime; these declarations only teach `tsc` about them.
 declare global {
-  interface ImportMeta {
-    readonly url: string;
-  }
   const Bun: {
     file(path: string | URL): { text(): Promise<string> };
   };
+
+  /** `Headers.entries()` — Hono returns a worker `Headers`, not the DOM one. */
+  interface Headers {
+    entries(): IterableIterator<[string, string]>;
+  }
 }
 
 /**
