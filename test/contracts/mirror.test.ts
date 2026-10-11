@@ -36,6 +36,14 @@ import {
   STATUS,
   TELEMETRY_REQUEST_SHAPES,
 } from "./contract-lock";
+import {
+  OTA_IMAGE,
+  OTA_LOCK_STRINGS,
+  OTA_OFFER,
+  OTA_ROUTES,
+  OTA_SHA256_HEX_LENGTH,
+  OTA_UPDATE_FIELDS,
+} from "./ota-lock";
 import { dirOf, filePathFromUrl, joinPath, readTextFileSync } from "./node-boundary";
 
 /** The shape of a Node system error thrown by a failed file read. */
@@ -247,5 +255,108 @@ describe("mirror: body field names agree with contract-lock.ts", () => {
     // `metric` is the reserved shorthand key, distinct from the per-entry
     // METRIC_FIELDS names (`key`/`value`) — the lock records both.
     expect(METRIC_FIELDS).toEqual(["key", "value"]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// OTA routes — the shape frozen in `ota-lock.ts` (spec §6.4/§6.5). The routes
+// are not server-side yet, but the SDK mirror still declares the paths, the
+// firmware request header, the media type and the retry-after header, so a
+// one-sided edit here — either side — is caught. This is what keeps the OTA
+// shape honest while both halves are shape-only.
+// ---------------------------------------------------------------------------
+
+interface CppOtaRoute {
+  method: string;
+  path: string;
+  contentType: string;
+  implemented: boolean;
+}
+
+/** Parse the `kOtaRoutes[]` initializer list from the SDK mirror. */
+function cppOtaRoutes(source: string): CppOtaRoute[] {
+  const start = source.indexOf("const OtaRoute kOtaRoutes[] = {");
+  if (start < 0) throw new Error("SDK mirror is missing the kOtaRoutes[] table");
+  const open = source.indexOf("{", start);
+  const close = source.indexOf("};", open);
+  if (open < 0 || close < 0) throw new Error("could not bracket the kOtaRoutes[] table");
+
+  const routes: CppOtaRoute[] = [];
+  const re = /\{\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*"([^"]*)"\s*,\s*(true|false)\s*\}/g;
+  const body = source.slice(open, close);
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(body)) !== null) {
+    routes.push({
+      method: m[1],
+      path: m[2],
+      contentType: m[3],
+      implemented: m[4] === "true",
+    });
+  }
+  return routes;
+}
+
+describe("mirror: OTA route shape agrees with ota-lock.ts", () => {
+  const routes = cppOtaRoutes(MIRROR);
+
+  it("the kOtaRouteCount guard matches the parsed table", () => {
+    expect(cppIntConstant(MIRROR, "kOtaRouteCount")).toBe(routes.length);
+  });
+
+  it("freezes the same two paths (offer + image)", () => {
+    expect(routes.map((r) => r.path)).toEqual([OTA_OFFER.path, OTA_IMAGE.path]);
+    expect(routes.map((r) => r.method)).toEqual([OTA_OFFER.method, OTA_IMAGE.method]);
+  });
+
+  it("freezes the path family as distinct /v1/ota + /v1/ota/image", () => {
+    expect(cppStringConstant(MIRROR, "kOtaOfferPath")).toBe(OTA_LOCK_STRINGS.offerPath);
+    expect(cppStringConstant(MIRROR, "kOtaImagePath")).toBe(OTA_LOCK_STRINGS.imagePath);
+    expect(OTA_IMAGE.path.startsWith(OTA_OFFER.path + "/")).toBe(true);
+  });
+
+  it("sends the running firmware version in the offer's request header", () => {
+    expect(cppStringConstant(MIRROR, "kOtaFirmwareHeader")).toBe(OTA_OFFER.requestHeader);
+    expect(cppStringConstant(MIRROR, "kOtaFirmwareHeader")).toBe(CONTRACT_HEADERS.firmware);
+    // The device ingress under test also carries it — same frozen bytes.
+    expect(cppStringConstant(MIRROR, "kHeaderFirmware")).toBe(CONTRACT_HEADERS.firmware);
+  });
+
+  it("serves the image as application/octet-stream", () => {
+    expect(cppStringConstant(MIRROR, "kOtaImageContentType")).toBe(OTA_IMAGE.contentType);
+    // The image route (index 1) carries the media type; the offer carries none.
+    expect(routes[1].contentType).toBe(OTA_IMAGE.contentType);
+    expect(routes[0].contentType).toBe("");
+  });
+
+  it("freezes retry-after as the 429 header", () => {
+    expect(cppStringConstant(MIRROR, "kOtaRetryAfterHeader")).toBe(OTA_IMAGE.rateLimited.header);
+    expect(OTA_IMAGE.rateLimited.header).toBe("retry-after");
+  });
+
+  it("both routes are marked not implemented on both sides", () => {
+    expect(routes.map((r) => r.implemented)).toEqual([false, false]);
+    expect(OTA_OFFER.implemented).toBe(false);
+    expect(OTA_IMAGE.implemented).toBe(false);
+  });
+
+  it("the image route's 429/404 statuses agree with the frozen lock", () => {
+    expect(OTA_IMAGE.rateLimited.status).toBe(STATUS.tooManyRequests);
+    expect(OTA_IMAGE.notFound.status).toBe(STATUS.notFound);
+    // The SDK encodes the same ints for these (see test_main.cpp).
+    expect(cppIntConstant(MIRROR, "kStatusTooManyRequests")).toBe(STATUS.tooManyRequests);
+    expect(cppIntConstant(MIRROR, "kStatusNotFound")).toBe(STATUS.notFound);
+  });
+
+  it("the OTA update fields mirror the lock's `update` object fields", () => {
+    const update = JSON.parse(cppStringConstant(MIRROR, "kOtaUpdate")) as {
+      update: Record<string, unknown>;
+    };
+    expect(new Set(Object.keys(update.update))).toEqual(new Set(OTA_UPDATE_FIELDS));
+    expect(OTA_SHA256_HEX_LENGTH).toBe(64);
+  });
+
+  it("the aggregate covers both routes", () => {
+    expect(Object.keys(OTA_ROUTES).sort()).toEqual(["image", "offer"]);
+    expect(cppIntConstant(MIRROR, "kOtaRouteCount")).toBe(Object.keys(OTA_ROUTES).length);
   });
 });
