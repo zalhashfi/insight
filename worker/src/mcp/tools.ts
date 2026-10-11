@@ -1140,7 +1140,11 @@ export function createMcpTools(deps: McpToolDeps): McpTools {
     const numeric = new Set(
       (SPECS[name]?.params ?? []).filter((p) => p.type === "number").map((p) => p.name),
     );
-    const args: Record<string, unknown> = {};
+    // `Object.create(null)`: the keys come from the query string, so a
+    // `__proto__`/`constructor` key must not resolve to Object.prototype. Values
+    // are always primitives here (a String or a finite Number), so this is
+    // defence in depth against prototype pollution, not a live fix.
+    const args: Record<string, unknown> = Object.create(null);
     url.searchParams.forEach((value, key) => {
       if (key === "tool") return;
       if (numeric.has(key)) {
