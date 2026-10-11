@@ -31,6 +31,30 @@
  * `next_seq` is a per-stream monotonic counter. It advances *only* on accept,
  * which is what makes the rejected sample's non-advance observable in tests.
  *
+ * ## Idempotency (dedup)
+ *
+ * The write path is delivered at least once — a device retries, the edge
+ * re-delivers — so `ingest` refuses a re-delivery of the point it already
+ * holds. The identity is `(device, metric, ts, seq)` and the rule that defines
+ * it is owned by `domains/telemetry/dedup.ts`; this class applies it at the one
+ * place a duplicate can land:
+ *
+ *   - `ts < latest_ts`  → `{ reason: "out_of_order" }` (the T1 gate; a stale ts
+ *     is refused before identity is even considered).
+ *   - `ts == latest_ts` → the incoming sample would reuse the stream's current
+ *     `seq` (`seq == latest_seq`), so its identity is exactly that of the stored
+ *     point: refused as `{ reason: "seen" }`, with the ring, seq counter and
+ *     projection untouched. A retry of an already-accepted point therefore
+ *     collapses onto the entry that exists and cannot be double-counted.
+ *   - `ts > latest_ts`  → accepted and assigned a fresh `seq`, even at a ts the
+ *     stream has not seen; this is the only way a *new* point is recorded.
+ *
+ * A producer that wants to express an INV-T2 tie in-band (same instant, fresh
+ * seq) does so by calling `ingest` with the fresh `seq`; the bare API reuses
+ * `latest_seq` for the tie, which is what makes a retry idempotent. See the
+ * case notes on {@link ShardDO.ingest} and the `streamKeyOf` helper for why
+ * `seq` is part of the key rather than `value`.
+ *
  * ## Capacity
  *
  * Each stream's ring holds at most {@link RING_CAPACITY} rows. When a stream is
@@ -44,6 +68,7 @@ import {
   SHARD_DDL,
   shardStatements,
 } from "./shard-schema";
+import { dedupKey } from "../../domains/telemetry/dedup";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -160,6 +185,17 @@ export type IngestResult =
       /** The stored latest ts the sample failed to beat. */
       readonly latestTs: number;
       readonly latestSeq: number;
+    }
+  | {
+      /**
+       * A re-delivery of the stream's current point: `(device, metric, ts)`
+       * match the stored latest. No entry was created and no seq consumed.
+       * The identity rule is owned by `domains/telemetry/dedup.ts`.
+       */
+      readonly accepted: false;
+      readonly reason: "seen";
+      readonly latestTs: number;
+      readonly latestSeq: number;
     };
 
 /** The projected state of one metric stream. */
@@ -189,6 +225,18 @@ function streamKey(device: string, metric: string): string {
   return `${device}${STREAM_SEPARATOR}${metric}`;
 }
 
+/**
+ * The identity key for a stream's current point: `device`, `metric`, `ts`, `seq`.
+ *
+ * Composes the shard's stream key with the shared `dedupKey` so the record's
+ * identity `(device, variable, ts, seq)` is expressed in one place — the rule
+ * lives in `domains/telemetry/dedup.ts`, and this is the shard's `metric`
+ * (= variable) spelled into it.
+ */
+function streamKeyOf(device: string, metric: string, ts: number, seq: number): string {
+  return dedupKey({ device, variable: metric, ts, seq });
+}
+
 /** Split a stream key back into its device and metric. */
 function splitStreamKey(key: string): { device: string; metric: string } {
   const at = key.indexOf(STREAM_SEPARATOR);
@@ -207,6 +255,15 @@ export class ShardDO {
   private readonly streams = new Map<string, StreamMeta>();
   /** Per-device dropped totals, so `getDropped()` needs no storage round-trip. */
   private readonly droppedByDevice = new Map<string, number>();
+  /**
+   * Identities `(device, metric, ts, seq)` already recorded — the dedup gate.
+   * One entry per live stream (each accept overwrites its stream's entry), so
+   * the set is bounded by `streams.size`. It answers the one question the bare
+   * `ingest` API can pose: "is this the stream's current point, re-sent?" A
+   * stale ts never reaches it (T1 rejects first), so no older point needs a
+   * slot here.
+   */
+  private readonly seenPoints = new Set<string>();
 
   constructor(options: ShardDOOptions) {
     this.storage = options.storage;
@@ -239,6 +296,12 @@ export class ShardDO {
    * See the class docblock for the ordering rules; the returned
    * {@link IngestResult} is a value, never a throw, so the caller maps it onto
    * whatever transport it is using.
+   *
+   * `seq` is assigned here from the stream's monotonic counter, which is what
+   * tells a re-delivery from a new reading at an equal `ts`: an identical
+   * `(device, metric, ts)` reuses the stored point's `seq` and is refused
+   * `{ reason: "seen" }` (dedup), while a reading at a strictly newer `ts` takes
+   * a fresh `seq` and is accepted.
    */
   async ingest(input: {
     device: string;
@@ -261,7 +324,30 @@ export class ShardDO {
           latestSeq: existing.latestSeq,
         };
       }
-      // T2: equal ts is LWW — fall through and accept, tie-broken by seq.
+      // T2: an equal ts is LWW, tie-broken by seq. Because `ingest` derives
+      // `seq` from the stream, a same-ts arrival reuses the stored point's
+      // identity `(device, metric, ts, latest_seq)` — i.e. it *is* the stored
+      // point re-sent — so it is refused as a re-delivery rather than admitted.
+      // A stale ts is refused earlier (T1); a strictly newer ts is admitted
+      // below with a fresh seq. See `domains/telemetry/dedup.ts` for the rule.
+      if (ts === existing.latestTs) {
+        // Dedup gate — identity `(device, metric, ts, seq)`. Without this, a
+        // retried at-least-once delivery would append a second ring row
+        // (double-count) and burn a seq. Reject without touching latest, ring
+        // or nextSeq, mirroring the T1 path.
+        const id = streamKeyOf(device, metric, ts, existing.latestSeq);
+        for (const key of this.seenPoints) {
+          if (key === id) {
+            return {
+              accepted: false,
+              reason: "seen",
+              latestTs: existing.latestTs,
+              latestSeq: existing.latestSeq,
+            };
+          }
+        }
+        this.seenPoints.add(id);
+      }
     }
 
     const seq = existing?.nextSeq ?? 0;
@@ -291,6 +377,10 @@ export class ShardDO {
     await this.storage.appendRing(sample);
     await this.storage.appendInflight(sample);
     await this.storage.putMeta(next);
+
+    // Record the accepted point's identity, replacing the stream's previous
+    // one (one entry per live stream — see the `seenPoints` field).
+    this.seenPoints.add(streamKeyOf(device, metric, ts, seq));
 
     this.streams.set(key, next);
 

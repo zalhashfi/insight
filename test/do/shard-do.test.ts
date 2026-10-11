@@ -108,15 +108,29 @@ describe("ShardDO.ingest — ordering (INV-T1/T2)", () => {
     expect(ring.map((row) => row.ts)).toEqual([10, 11]);
   });
 
-  it("accepts an equal ts as last-write-wins, tie-broken by seq", async () => {
+  it("resolves an equal ts by seq: a same-ts retry is the stored point, a newer ts wins", async () => {
     const { do: shardDO } = await shard();
 
     await accept(shardDO, { value: 1, ts: 100 });
-    const seq = await accept(shardDO, { value: 2, ts: 100 });
 
+    // INV-T2 is "equal ts is LWW, tie-broken by seq". The bare `ingest` API
+    // derives `seq` from the stream, so a same-ts arrival reuses the stored
+    // point's identity `(device, metric, ts, seq)` — it is the stored point
+    // re-sent, refused by the dedup gate (A13) rather than overwriting.
+    const retry = await shardDO.ingest({
+      device: DEVICE,
+      metric: METRIC,
+      value: 2,
+      ts: 100,
+    });
+    expect(retry).toMatchObject({ accepted: false, reason: "seen" });
+    expect(shardDO.getState(DEVICE, METRIC)[0]).toMatchObject({ value: 1, ts: 100, seq: 0 });
+
+    // A strictly newer ts is a genuinely new point: it takes a fresh seq and
+    // becomes the winner, so the stream still moves forward.
+    const seq = await accept(shardDO, { value: 3, ts: 101 });
     expect(seq).toBe(1);
-    const state = shardDO.getState(DEVICE, METRIC);
-    expect(state[0]).toMatchObject({ value: 2, ts: 100, seq: 1 });
+    expect(shardDO.getState(DEVICE, METRIC)[0]).toMatchObject({ value: 3, ts: 101, seq: 1 });
   });
 });
 
