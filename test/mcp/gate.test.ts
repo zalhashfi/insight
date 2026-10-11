@@ -532,6 +532,50 @@ describe("mcp oauth — authorization_code exchange (RFC 6749 §4.1.3)", () => {
     expect(write.status).toBe(200);
   });
 
+  it("refuses a code exchange requesting a scope OUTSIDE the grant (RFC 6749 §4.1.3)", async () => {
+    // The grant carries `mcp:manage`. Requesting `mcp:read` — a real scope the
+    // grant does NOT carry — is refused rather than silently accepted/narrowed.
+    const { app } = await oauthHarness();
+    const res = await tokenRequest(app, {
+      grant_type: "authorization_code",
+      code: "authcode_1",
+      client_id: CLIENT,
+      redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
+      scope: "mcp:read",
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_scope" });
+  });
+
+  it("refuses a code exchange requesting an UNKNOWN scope", async () => {
+    const { app } = await oauthHarness();
+    const res = await tokenRequest(app, {
+      grant_type: "authorization_code",
+      code: "authcode_1",
+      client_id: CLIENT,
+      redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
+      scope: "mcp:admin-superuser",
+    });
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_scope" });
+  });
+
+  it("accepts a code exchange whose scope is a SUBSET of the grant", async () => {
+    const { app } = await oauthHarness();
+    const res = await tokenRequest(app, {
+      grant_type: "authorization_code",
+      code: "authcode_1",
+      client_id: CLIENT,
+      redirect_uri: REDIRECT,
+      code_verifier: VERIFIER,
+      scope: "mcp:manage", // exactly the granted scope
+    });
+    expect(res.status).toBe(200);
+    expect((await res.json()) as Record<string, unknown>).toMatchObject({ scope: "mcp:manage" });
+  });
+
   it("refuses an exchange with no code_verifier (OAuth 2.1 mandates PKCE)", async () => {
     const { app, grants } = await oauthHarness();
 

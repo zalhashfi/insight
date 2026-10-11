@@ -299,8 +299,10 @@ describe("frameableHeaders — the /embed framing override", () => {
     const csp = res.headers.get("Content-Security-Policy") ?? "";
 
     expect(csp).toContain("frame-ancestors https://app.example.com https://ops.example.org");
-    // The legacy header is emptied (never DENY), so it cannot contradict the CSP.
-    expect(res.headers.get("X-Frame-Options")).toBe("");
+    // With a configured allow-list the legacy header is OMITTED entirely (it has
+    // no origin-list form), so it can neither contradict the CSP nor falsely
+    // signal a restriction the browser would enforce as DENY.
+    expect(res.headers.get("X-Frame-Options")).toBeNull();
     // The other directives survive untouched — framing is the ONLY relaxation.
     expect(csp).toContain("default-src 'self'");
     expect(csp).toContain("base-uri 'self'");

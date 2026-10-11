@@ -804,6 +804,20 @@ export function createMcpOAuth(deps: McpOAuthDeps): Hono {
       return fail(c, 400, "invalid_grant", "the code_verifier does not match the code_challenge");
     }
 
+    // RFC 6749 §4.1.3: a `scope` on the code exchange must be a SUBSET of the
+    // grant's — the code's scopes are the ceiling. An unknown scope, or one the
+    // grant does not carry, is refused (`invalid_scope`) rather than silently
+    // narrowed or widened. Symmetric with the refresh grant.
+    const requested = parseRequestedScopes(form.get("scope"));
+    if (requested.unknown.length > 0) {
+      return fail(c, 400, "invalid_scope", `unknown scope: ${requested.unknown.join(" ")}`);
+    }
+    for (const scope of requested.scopes) {
+      if (!grant.scopes.includes(scope)) {
+        return fail(c, 400, "invalid_scope", `scope exceeds the grant: ${scope}`);
+      }
+    }
+
     return mint(c, grant.client_id, grant.scopes, grant.projectId, true);
   }
 

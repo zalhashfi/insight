@@ -410,11 +410,6 @@ export interface McpToolSpec extends McpTool {
   readonly scope: McpScope;
 }
 
-/** Does this tool require `mcp:manage` (i.e. is it a write)? */
-export function requiresManageScope(tool: McpTool): boolean {
-  return tool.kind === "write";
-}
-
 /** Parameter helper: a required string. */
 const str = (name: string): McpToolParam => ({ name, type: "string", required: true });
 /** Parameter helper: an optional string. */

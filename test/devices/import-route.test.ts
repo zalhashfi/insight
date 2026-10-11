@@ -155,13 +155,14 @@ function harness(limits?: { maxBytes?: number; maxRows?: number }): Harness {
 function importRequest(
   app: App,
   body: string,
-  options: { session?: string; query?: string; contentType?: string } = {},
+  options: { session?: string; query?: string; contentType?: string; contentLength?: string } = {},
 ): Promise<Response> {
   return Promise.resolve(
     app.request(`/v1/admin/projects/${PROJECT}/devices/import${options.query ?? ""}`, {
       method: "POST",
       headers: {
         "content-type": options.contentType ?? "text/csv",
+        ...(options.contentLength !== undefined ? { "content-length": options.contentLength } : {}),
         ...(options.session !== undefined ? { Authorization: `Bearer ${options.session}` } : {}),
       },
       body,
@@ -318,6 +319,30 @@ describe("import byte-size cap", () => {
     const { app } = harness({ maxBytes: 12 });
     const res = await importRequest(app, "name\nAlpha\nBeta\n", { session: SESSION_ADMIN });
     expect(res.status).toBe(413);
+  });
+
+  it("refuses an oversized declared Content-Length BEFORE buffering the body (413)", async () => {
+    // A small body but a declared length over the limit: the route refuses on
+    // the header alone, so a client cannot make the runtime buffer an oversized
+    // body under a cap that only runs after buffering. A well-formed small CSV is
+    // sent so that, absent the pre-check, the import would SUCCEED.
+    const { app, repo } = harness({ maxBytes: 64 });
+    const res = await importRequest(app, CSV, {
+      session: SESSION_ADMIN,
+      contentLength: String(1024 * 1024),
+    });
+    expect(res.status).toBe(413);
+    expect(((await res.json()) as { error: string }).error).toBe("payload_too_large");
+    expect(await repo.listByProject(PROJECT)).toEqual([]);
+  });
+
+  it("accepts a declared Content-Length within the limit (the pre-check is not over-eager)", async () => {
+    const { app } = harness();
+    const res = await importRequest(app, CSV, {
+      session: SESSION_ADMIN,
+      contentLength: String(CSV.length),
+    });
+    expect(res.status).toBe(200);
   });
 
   it("the service throws payload_too_large (413) and never enters the parser", async () => {

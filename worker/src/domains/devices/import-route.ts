@@ -193,9 +193,24 @@ export function createDeviceImportHandler(
       return c.json(body, 400);
     }
 
-    // 4. Read the raw body — unchanged — and import. The byte cap is the
-    //    service's own `payload_too_large` (413), checked before it lexes, so
-    //    this route never walks a body it will refuse.
+    // 4. Reject an oversized upload BEFORE buffering it when the client declares
+    //    a `Content-Length`: the service's own byte cap (413) would otherwise only
+    //    run after the whole body is already in memory. A chunked upload (no
+    //    Content-Length) still falls through to the service cap, which gates
+    //    parsing; this pre-check additionally bounds the buffered body.
+    const maxBytes = deps.imports.limits.maxBytes;
+    const declared = Number(c.req.header("content-length") ?? "");
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      const body: DeviceImportRouteErrorBody = {
+        error: "payload_too_large",
+        message: `import body exceeds the ${maxBytes}-byte limit`,
+      };
+      return c.json(body, 413);
+    }
+
+    // Read the raw body, then import. The service re-checks the byte cap against
+    // the ACTUAL length (`payload_too_large`, 413) before it lexes, so a body
+    // that lies about its Content-Length — or has none — is still refused.
     const data = await c.req.text();
 
     try {

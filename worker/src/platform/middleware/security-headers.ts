@@ -177,19 +177,29 @@ export function frameableHeaders(options: FrameableOptions = {}): MiddlewareHand
     .map((o) => o.trim())
     .filter((o) => o.length > 0);
   const csp = contentSecurityPolicyForFrames(ancestors);
-  // `X-Frame-Options` has no origin-list form (only DENY/SAMEORIGIN). When
-  // specific ancestors are configured, CSP is the real control; emitting
-  // `SAMEORIGIN` would contradict it, so the header is emitted EMPTY — present
-  // but ignored by modern browsers — and CSP governs framing. With no
-  // configured ancestors the policy is self-only, so `SAMEORIGIN` states
-  // exactly that in the legacy header too.
-  const xfo = ancestors.length > 0 ? "" : "SAMEORIGIN";
+  // `X-Frame-Options` has no origin-list form (only DENY/SAMEORIGIN), so it can
+  // express a self-only policy but NOT a configured allow-list.
+  //
+  //   * No configured ancestors → the policy IS self-only, so the legacy header
+  //     states it exactly: `SAMEORIGIN`.
+  //   * Configured ancestors → the header is OMITTED (deleted) rather than sent
+  //     empty. CSP `frame-ancestors` is the control. A legacy browser without
+  //     `frame-ancestors` support therefore applies NO XFO restriction and may
+  //     frame /embed from any origin — an accepted, documented tradeoff for a
+  //     read-only public embed whose access is gated by the share token, and
+  //     strictly better than emitting `SAMEORIGIN`, which would *contradict* and
+  //     break the configured origins on every modern browser.
+  const xfo = ancestors.length > 0 ? null : "SAMEORIGIN";
 
   return async function frameableHeadersMiddleware(c, next) {
     await next();
 
     c.res.headers.set("Content-Security-Policy", csp);
-    c.res.headers.set("X-Frame-Options", xfo);
+    if (xfo === null) {
+      c.res.headers.delete("X-Frame-Options");
+    } else {
+      c.res.headers.set("X-Frame-Options", xfo);
+    }
   };
 }
 

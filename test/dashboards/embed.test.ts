@@ -387,7 +387,9 @@ describe("composed app — /embed framing override", () => {
     expect(res.headers.get("Content-Security-Policy")).toContain(
       "frame-ancestors https://dash.example.com",
     );
-    expect(res.headers.get("X-Frame-Options")).toBe("");
+    // The legacy header is omitted for a configured allow-list (no origin-list
+    // form); CSP is the control.
+    expect(res.headers.get("X-Frame-Options")).toBeNull();
   });
 
   it("a normal composed app route STILL carries the DENY baseline", async () => {
