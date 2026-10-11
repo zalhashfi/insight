@@ -58,6 +58,19 @@ async function aRealEncodedKey(): Promise<string> {
   return (await generateSecretKey()).encoded;
 }
 
+/**
+ * A Stripe-shaped key assembled at RUNTIME.
+ *
+ * The scanner's `stripe-secret-key` rule matches `sk_live_` + a base62 body, and
+ * this fixture must exercise that rule — but a literal `sk_live_…` in the source
+ * is exactly what GitHub's push-protection flags. Concatenating the prefix keeps
+ * the scan honest (the scanner still sees the full value) while leaving no
+ * flagged literal in the committed file.
+ */
+function fakeStripeKey(): string {
+  return ["sk", "live", "51H8PLANTEDmarkerForTheScan00000"].join("_");
+}
+
 describe("loadSecrets — deploy-time bindings", () => {
   it("loads a secret from env", async () => {
     const encoded = await aRealEncodedKey();
@@ -139,7 +152,7 @@ describe("scanSource — known credential formats", () => {
   });
 
   it("catches a Stripe secret key", () => {
-    const findings = scanSource("a.ts", `const k = "@@STRIPE_SHAPED_FIXTURE@@";`);
+    const findings = scanSource("a.ts", `const k = "${fakeStripeKey()}";`);
     expect(findings.map((f) => f.rule)).toContain("stripe-secret-key");
   });
 
@@ -396,7 +409,7 @@ describe("the scan catches a planted marker (and leaves the tree clean)", () => 
     // A marker planted in an isolated temp file — NOT in the source tree — so
     // the proof never leaves a secret literal behind. This is byte-for-byte the
     // rule the real tree walk runs below.
-    const plantedMarker = "@@PLANTED_STRIPE_FIXTURE@@";
+    const plantedMarker = fakeStripeKey();
     const planted: ScannableFile = {
       path: "<planted>/leaky-config.ts",
       content: `export const PROVIDER_KEY = "${plantedMarker}";\n`,
@@ -422,7 +435,7 @@ describe("the scan catches a planted marker (and leaves the tree clean)", () => 
   it("assertNoHardcodedSecrets throws (naming path + line) on a planted secret", () => {
     const planted: ScannableFile = {
       path: "<planted>/leaky-config.ts",
-      content: `export const KEY = "@@PLANTED_STRIPE_FIXTURE@@";\n`,
+      content: `export const KEY = "${fakeStripeKey()}";\n`,
     };
     expect(() => assertNoHardcodedSecrets([planted])).toThrow(/leaky-config\.ts:1/);
   });
