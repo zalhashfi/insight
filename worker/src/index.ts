@@ -11,6 +11,17 @@
  *   POST /v1/telemetry                             -> 204, or 400/401/403/413
  *   GET  /v1/projects/:proj/state                  -> 200 { "state": [...] }
  *   GET  /v1/projects/:proj/variables/:key/series  -> 200 { "series": [...] }
+ *   GET  /v1/ota                                   -> 200 { "update": null | {...} }
+ *   GET  /v1/ota/image                             -> 200 octet-stream, or 429/404
+ *   GET  /v1/control                               -> 200 { "control": [...] }
+ *   POST /v1/control/ack                           -> 204
+ *   GET  /v1/control/ws                            -> 101 upgrade
+ *   POST /v1/events                                -> 204, or 400/401
+ *   POST /v1/admin/projects/:proj/automations/:id/run -> 200 { "run": {...} }
+ *   GET  /v1/public/dashboards/:token              -> 200 { "variables", "points" }
+ *
+ * The M3 routes are mounted **only** when the matching {@link BindingAdapters.m3}
+ * group is supplied; an M1-only binding composes exactly the M1 surface.
  *
  * The `app` is exported so tests can exercise the composed surface in-process
  * via `app.request("/healthz")` without a running server; `fetch` is exposed on
@@ -50,7 +61,11 @@ import type { CredentialResolver } from "./domains/telemetry/query";
  *                       token to a `DevicePrincipal` carrying its scopes;
  *   - `credentials`   — the read route's resolver, token -> project id;
  *   - `sink` / `devices` / `projects` / `shards` — the Durable Object and
- *                       registry seams the ingest and read routes write/read.
+ *                       registry seams the ingest and read routes write/read;
+ *   - `m3`            — the optional M3 seam groups (OTA, control, events,
+ *                       manual-run, public dashboard). Omit any group and its
+ *                       route is not mounted; supply it and the route appears,
+ *                       wired to the real seams the deploy holds.
  */
 export interface BindingAdapters {
   readonly deviceTokens: DeviceTokenResolver;
@@ -59,6 +74,8 @@ export interface BindingAdapters {
   readonly credentials: CredentialResolver;
   readonly ingest: AppDeps["ingest"];
   readonly query: AppDeps["query"];
+  /** Optional M3 seam groups; each mounts its own route group when present. */
+  readonly m3?: AppDeps["m3"];
   /** Advertised build identity; defaults to the skeleton's `0.0.1`. */
   readonly version?: VersionInfo;
 }
@@ -83,6 +100,9 @@ export function buildDeps(adapters: BindingAdapters): AppDeps {
       ...adapters.query,
       credentials: adapters.credentials,
     },
+    // M3 groups are passed through verbatim; an absent group leaves its routes
+    // unmounted, which is the honest state for a deploy that has not bound them.
+    m3: adapters.m3,
     version: adapters.version,
   };
 }

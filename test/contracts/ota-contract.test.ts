@@ -25,7 +25,12 @@
  */
 
 import { describe, expect, it } from "vitest";
-import { createApp, type AppDeps } from "../../worker/src/app";
+import { createApp, type App, type AppDeps } from "../../worker/src/app";
+import {
+  InMemoryFirmwareRepo,
+  InMemoryImageStore,
+  firmwareKey,
+} from "../../worker/src/domains/firmware/upload";
 import {
   CONTRACT_HEADERS,
   GET_OTA,
@@ -102,6 +107,85 @@ function fakeDeps(): AppDeps {
   };
 }
 
+/**
+ * The REAL composed app with the OTA seam group supplied — the app M3 wired.
+ *
+ * `createApp` mounts `GET /v1/ota` and `GET /v1/ota/image` because `deps.m3.ota`
+ * carries their seams. The firmware rows and the object store are the module's
+ * own fakes, so an offered `size`/`sha256` is what the *upload* path recorded.
+ * Driving this app — never a route-less stub — is what makes the wires provable.
+ */
+const OTA_PROJECT = "proj_contract";
+const OTA_TOKEN = "pt_contract_live";
+const OTA_VERSION = "1.2.0";
+const OTA_BYTES = new Uint8Array([0x01, 0x02, 0x03, 0x04, 0x05]);
+
+interface LiveOta {
+  app: App;
+  firmware: InMemoryFirmwareRepo;
+  images: InMemoryImageStore;
+}
+
+function liveOta(): LiveOta {
+  const firmware = new InMemoryFirmwareRepo();
+  const images = new InMemoryImageStore();
+  const verifyToken = async (token: string) =>
+    token === OTA_TOKEN
+      ? { kind: "device" as const, projectId: OTA_PROJECT, scopes: "read write" }
+      : null;
+
+  const deps: AppDeps = {
+    deviceTokens: verifyToken,
+    sessions: async () => null,
+    ingest: {
+      verifyToken,
+      sink: { record: async () => undefined },
+      devices: { register: () => undefined, has: () => false },
+    },
+    query: {
+      credentials: async () => null,
+      projects: { state: async () => [] },
+      shards: { ring: async () => [] },
+    },
+    m3: {
+      ota: {
+        // The project pins OTA_VERSION; only that version is offerable.
+        offer: {
+          firmware,
+          targets: { assigned: async () => OTA_VERSION, latest: async () => OTA_VERSION },
+          verifyToken,
+        },
+        image: {
+          images: { get: async (key) => images.get(key) ?? null },
+          firmware: {
+            findKey: async (projectId, version) =>
+              (await firmware.find(projectId, version))?.r2Key ?? null,
+          },
+          quota: { consume: async () => ({ allowed: true as const }) },
+          verifyToken,
+        },
+      },
+    },
+  };
+  return { app: createApp(deps), firmware, images };
+}
+
+/** Seed one firmware row + its stored bytes for {@link OTA_VERSION}. */
+async function seedFirmware(live: LiveOta): Promise<void> {
+  const key = firmwareKey(OTA_PROJECT, OTA_VERSION);
+  await live.images.put(key, OTA_BYTES, "application/octet-stream");
+  await live.firmware.insert({
+    id: "fw_1",
+    projectId: OTA_PROJECT,
+    version: OTA_VERSION,
+    size: OTA_BYTES.byteLength,
+    sha256: "a".repeat(OTA_SHA256_HEX_LENGTH),
+    r2Key: key,
+    createdAt: 0,
+    updatedAt: 0,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Lock self-consistency
 // ---------------------------------------------------------------------------
@@ -141,10 +225,10 @@ describe("ota-lock self-consistency", () => {
     expect(OTA_IMAGE.notFound.status).toBe(STATUS.notFound);
   });
 
-  it("marks both OTA routes as not implemented yet (M3 / A18b, A18c)", () => {
-    expect(OTA_OFFER.implemented).toBe(false);
-    expect(OTA_IMAGE.implemented).toBe(false);
-    expect(GET_OTA.implemented).toBe(false);
+  it("marks both OTA routes as implemented now (M3 / A18b, A18c)", () => {
+    expect(OTA_OFFER.implemented).toBe(true);
+    expect(OTA_IMAGE.implemented).toBe(true);
+    expect(GET_OTA.implemented).toBe(true);
   });
 
   it("exposes both routes through the aggregate", () => {
@@ -228,56 +312,72 @@ describe("GET /v1/ota/image shape", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Not-yet-implemented routes — asserted ABSENT, never invented
+// Wired routes — asserted PRESENT and shape-exact against the REAL composed app
 // ---------------------------------------------------------------------------
 
-describe("OTA routes are absent from the REAL composed app (M3 / A18b, A18c)", () => {
-  // The composed app mounts `securityHeaders` on `*`, the ingest router and the
-  // read router — everything production wires. A bare `new Hono()` would 404
-  // these paths no matter what `createApp` mounts, so it could never catch the
-  // OTA routes being wired: that is the vacuous 404 this suite must not use.
-  const app = createApp(fakeDeps());
+describe("OTA routes are wired into the REAL composed app (M3 / A18b, A18c)", () => {
+  // The probes drive the app M3 wired (`createApp` with `deps.m3.ota`), never a
+  // bare `new Hono()`: a route-less stub 404s everything and could never show
+  // that a route exists. A mounted route authenticates itself, so an anonymous
+  // request is answered with the route's own `401` (not the framework's `404`).
 
-  it("GET /v1/ota is NOT wired into createApp", async () => {
-    expect(OTA_OFFER.implemented).toBe(false);
-    const res = await app.request(OTA_OFFER.path, {
+  const bearer = { [CONTRACT_HEADERS.authorization]: `Bearer ${OTA_TOKEN}` };
+
+  it("GET /v1/ota is wired and answers its own 401 without a credential", async () => {
+    expect(OTA_OFFER.implemented).toBe(true);
+    const res = await createApp(fakeDeps()).request(OTA_OFFER.path, { method: OTA_OFFER.method });
+    // No OTA seam group => not mounted => framework 404. Proves opt-in wiring.
+    expect(res.status).toBe(STATUS.notFound);
+
+    const live = liveOta();
+    const mounted = await live.app.request(OTA_OFFER.path, { method: OTA_OFFER.method });
+    // Route-owned auth, NOT the framework's 404: the route exists.
+    expect(mounted.status).toBe(STATUS.unauthorized);
+  });
+
+  it("an up-to-date device gets exactly {\"update\":null}", async () => {
+    const live = liveOta();
+    await seedFirmware(live);
+    const res = await live.app.request(OTA_OFFER.path, {
       method: OTA_OFFER.method,
-      headers: {
-        [CONTRACT_HEADERS.authorization]: "Bearer pt_test",
-        [OTA_OFFER.requestHeader]: "1.0.0",
-      },
+      headers: { ...bearer, [OTA_OFFER.requestHeader]: OTA_VERSION },
     });
-    // Absent at the framework edge of the composed app — not at a route-less stub.
-    expect(res.status).toBe(STATUS.notFound);
+    expect(res.status).toBe(OTA_OFFER.success);
+    // Byte-for-byte the frozen no-update body.
+    expect(await res.text()).toBe(JSON.stringify(NO_UPDATE_BODY));
   });
 
-  it("GET /v1/ota/image is NOT wired into createApp", async () => {
-    expect(OTA_IMAGE.implemented).toBe(false);
-    const res = await app.request(OTA_IMAGE.path, {
+  it("a stale device gets an offer with exactly version/size/sha256/url", async () => {
+    const live = liveOta();
+    await seedFirmware(live);
+    const res = await live.app.request(OTA_OFFER.path, {
+      method: OTA_OFFER.method,
+      headers: { ...bearer, [OTA_OFFER.requestHeader]: "0.0.1" },
+    });
+    expect(res.status).toBe(OTA_OFFER.success);
+    const body = (await res.json()) as Record<string, unknown>;
+    expect(Object.keys(body)).toEqual([ENVELOPE]);
+    const update = body[ENVELOPE] as Record<string, unknown>;
+    // The four frozen fields, in contract order — and the URL is the image path.
+    expect(Object.keys(update)).toEqual([VERSION, SIZE, SHA256, URL]);
+    expect(update[VERSION]).toBe(OTA_VERSION);
+    expect(update[SIZE]).toBe(OTA_BYTES.byteLength);
+    expect(update[URL]).toBe(OTA_IMAGE.path);
+  });
+
+  it("GET /v1/ota/image serves the exact bytes as octet-stream", async () => {
+    const live = liveOta();
+    await seedFirmware(live);
+    const res = await live.app.request(OTA_IMAGE.path, {
       method: OTA_IMAGE.method,
-      headers: {
-        [CONTRACT_HEADERS.authorization]: "Bearer pt_test",
-        [OTA_IMAGE.requestHeader]: "1.0.0",
-      },
+      headers: { ...bearer, [OTA_IMAGE.requestHeader]: OTA_VERSION },
     });
-    expect(res.status).toBe(STATUS.notFound);
+    expect(res.status).toBe(OTA_IMAGE.success);
+    expect(res.headers.get("content-type")).toBe(OTA_IMAGE.contentType);
+    expect(new Uint8Array(await res.arrayBuffer())).toEqual(OTA_BYTES);
   });
 
-  it("the /v1/ota family is genuinely unrouted (a control path resolves first)", async () => {
-    // The 404s above are the framework edge, not a blanket "nothing answers":
-    // a sibling `/v1` route the composed app DOES mount proves the app routes
-    // requests at all, so the OTA 404s are about OTA being unwired, not about a
-    // dead app. `/v1/version` is constant and needs no credential.
-    const known = await app.request("/v1/version", { method: "GET" });
-    expect(known.status).toBe(STATUS.ok);
-    // And a path one segment under the offer path is likewise absent.
-    const deeper = await app.request(`${OTA_OFFER.path}/anything`, { method: "GET" });
-    expect(deeper.status).toBe(STATUS.notFound);
-  });
-
-  it("the frozen 429 and 404 are what the routes WILL return once wired", () => {
-    // Encoded here as constants (not live responses) so the shape is frozen
-    // even while the route is absent. A18c's acceptance names exactly these.
+  it("the frozen 429 and 404 are the image route's quota/missing statuses", () => {
     expect(OTA_IMAGE.rateLimited.status).toBe(STATUS.tooManyRequests);
     expect(OTA_IMAGE.notFound.status).toBe(STATUS.notFound);
     // A 429 and a 404 are distinct, and neither is a success.

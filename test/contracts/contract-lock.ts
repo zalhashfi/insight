@@ -77,8 +77,8 @@ export type StatusCode = (typeof STATUS)[StatusName];
  * status that carries it and whether the server route exists today.
  *
  * `implemented: false` means the code is part of the frozen spec shape but its
- * route is not wired yet (M3 / A18); the test asserts only the parts that
- * exist and records the rest.
+ * route is not wired yet; the test asserts only the parts that exist and
+ * records the rest. As of M3 every code here is `true` (the M3 surfaces landed).
  */
 export const CONTRACT_ERRORS = {
   // --- live today --------------------------------------------------------
@@ -183,16 +183,16 @@ export const OTA_RESPONSE_FIELDS = ["update"] as const;
 /** Field names of the `update` object when a newer firmware is available. */
 export const OTA_UPDATE_FIELDS = ["version", "size", "sha256", "url"] as const;
 
-/** `GET /v1/ota` — NOT implemented server-side yet (M3 / A18). */
+/** `GET /v1/ota` — wired server-side (M3 / A18b). */
 export const GET_OTA = {
   method: "GET",
   path: "/v1/ota",
   /**
-   * No Hono route exists today. The shape below is frozen from spec §6.4 so the
-   * SDK can encode it; the insight suite MUST NOT fabricate the route and
-   * asserts nothing about live behaviour here beyond the absence of a route.
+   * The route is live: `createApp` mounts it through `AppDeps.m3.ota.offer`.
+   * The shape below was frozen from spec §6.4 before it landed; the flag flipped
+   * when A18b wired the handler, and the fields did not move.
    */
-  implemented: false,
+  implemented: true,
   auth: "project-token (bearer)",
   headers: [CONTRACT_HEADERS.authorization, CONTRACT_HEADERS.firmware],
   success: STATUS.ok,
@@ -221,11 +221,11 @@ export const CONTROL_COMMAND_FIELDS = ["id", "variable", "value"] as const;
 /** Field names of the `POST /v1/control/ack` body. */
 export const CONTROL_ACK_REQUEST_FIELDS = ["ids"] as const;
 
-/** `GET /v1/control` — the control read surface is not wired server-side yet. */
+/** `GET /v1/control` — the control read surface, wired server-side (M3 / A19). */
 export const GET_CONTROL = {
   method: "GET",
   path: "/v1/control",
-  implemented: false,
+  implemented: true,
   auth: "project-token (bearer)",
   headers: [CONTRACT_HEADERS.authorization],
   success: STATUS.ok,
@@ -241,11 +241,11 @@ export const GET_CONTROL = {
   errors: [{ code: "unauthorized", status: STATUS.unauthorized }],
 } as const;
 
-/** `POST /v1/control/ack` — not wired server-side yet; shape frozen from §6.3. */
+/** `POST /v1/control/ack` — wired server-side (M3 / A19); shape frozen from §6.3. */
 export const POST_CONTROL_ACK = {
   method: "POST",
   path: "/v1/control/ack",
-  implemented: false,
+  implemented: true,
   auth: "project-token (bearer)",
   requestFields: CONTROL_ACK_REQUEST_FIELDS,
   success: STATUS.noContent,

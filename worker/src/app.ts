@@ -1,5 +1,5 @@
 /**
- * app — the M1 deployable Worker, expressed as a **pure factory over seams**.
+ * app — the deployable Worker (M1 + M3), expressed as a **pure factory over seams**.
  *
  * `createApp(deps)` composes the whole HTTP surface out of the domain modules
  * that already exist; it re-implements none of them. The return value is a
@@ -22,6 +22,11 @@
  *   | `POST /v1/telemetry`             | {@link AppDeps.ingest}          |
  *   | `GET  /v1/projects/:proj/state`  | {@link AppDeps.query}           |
  *   | `GET  /v1/projects/:proj/variables/:key/series` | {@link AppDeps.query} |
+ *   | `GET  /v1/ota` + `GET /v1/ota/image` | {@link AppDeps.m3}.ota       |
+ *   | `GET  /v1/control` + `/ack` + `/ws` | {@link AppDeps.m3}.control   |
+ *   | `POST /v1/events`                | {@link AppDeps.m3}.events       |
+ *   | `POST /v1/admin/projects/:proj/automations/:id/run` | {@link AppDeps.m3}.manualRun |
+ *   | `GET  /v1/public/dashboards/:token` | {@link AppDeps.m3}.publicDashboard |
  *
  * ## Dependencies are injected, never faked
  *
@@ -85,9 +90,44 @@ import {
   type ProjectLookup,
   type ShardLookup,
 } from "./domains/telemetry/query";
+import {
+  createEvents,
+  type EventDispatcher,
+  type VerifyEventToken,
+} from "./domains/telemetry/events";
+import {
+  createControl,
+  type ControlDeps,
+  type ControlPlane,
+  type VerifyControlToken,
+} from "./domains/telemetry/control";
+import {
+  createControlWs,
+  type ControlWsDeps,
+  type WebSocketRuntime,
+} from "./domains/telemetry/control-ws";
+import {
+  createOtaImage,
+  type ImageDeps,
+} from "./domains/firmware/image";
+import {
+  createOtaOffer,
+  type OfferDeps,
+} from "./domains/firmware/offer";
+import {
+  createManualRun,
+  type ManualRunDeps,
+} from "./platform/engine/manual-run";
+import {
+  PublicDashboardService,
+  isPublicDashboardError,
+  type PublicDashboardOptions,
+} from "./domains/dashboards/public";
 import { securityHeaders } from "./platform/middleware/security-headers";
 import {
+  resolveAdminProject,
   resolveDeviceProject,
+  type CredentialLookup,
   type DeviceTokenResolver,
   type ResolveProjectVariables,
   type SessionResolver,
@@ -173,6 +213,59 @@ export interface AppDeps {
     /** Clock used to bound the series window. */
     readonly now?: () => number;
   };
+  /**
+   * M3 surfaces. Every field is optional and independent: when a group is
+   * omitted the corresponding route is simply not mounted, so an M1-only deploy
+   * keeps composing unchanged. A deploy that wants the two-way control plane,
+   * discrete events, OTA, admin manual-run or the public dashboard supplies the
+   * matching group and the route appears — behind exactly the middleware that
+   * owns its contract (device bearer for the device surfaces, the admin session
+   * gate for the run route, the share resolver for the public read).
+   */
+  readonly m3?: {
+    /**
+     * `GET /v1/ota` + `GET /v1/ota/image`. Both authenticate themselves through
+     * their own injected `verifyToken`; no upstream gate is mounted, so a
+     * rejected credential is the route's own `401 { error: "unauthorized" }`.
+     */
+    readonly ota?: {
+      readonly offer: OfferDeps;
+      readonly image: ImageDeps;
+    };
+    /**
+     * `GET /v1/control`, `POST /v1/control/ack` and `GET /v1/control/ws`. The
+     * HTTP and socket transports share ONE control plane + verifier, so they can
+     * never authenticate or deliver differently.
+     */
+    readonly control?: {
+      readonly plane: ControlPlane;
+      readonly verifyToken: VerifyControlToken;
+      /** The socket upgrade seam; omit to serve the HTTP transports only. */
+      readonly ws?: WebSocketRuntime;
+      /** Bind delivered commands to the calling device (default true). */
+      readonly scopeToDevice?: boolean;
+    };
+    /** `POST /v1/events` — a device event that fires automations. */
+    readonly events?: {
+      readonly verifyToken: VerifyEventToken;
+      readonly dispatch: EventDispatcher;
+    };
+    /**
+     * `POST /v1/admin/projects/:proj/automations/:id/run`. Mounted on the
+     * `/v1/admin/projects` subtree behind {@link resolveAdminProject}, so the
+     * route is fail-closed on its own session gate.
+     */
+    readonly manualRun?: {
+      readonly deps: ManualRunDeps;
+      readonly credentials: CredentialLookup;
+    };
+    /**
+     * `GET /v1/public/dashboards/:token` — the allow-list-filtered public read.
+     * A share token is resolved by {@link PublicDashboardService}; the response
+     * never carries a variable outside the layout the share names.
+     */
+    readonly publicDashboard?: PublicDashboardOptions;
+  };
   /** Version identity served at `GET /v1/version`. */
   readonly version?: VersionInfo;
 }
@@ -199,7 +292,12 @@ export type AppVariables = ResolveProjectVariables;
 export type App = Hono<{ Variables: AppVariables }>;
 
 /**
- * Build the deployable M1 app from injected dependencies.
+ * Build the deployable Worker from injected dependencies.
+ *
+ * The M1 surface (health, version, ingest, read) is always composed. The M3
+ * surfaces (OTA, control, events, admin manual-run, public dashboard) are
+ * composed only when {@link AppDeps.m3} supplies their seam groups — see
+ * {@link mountM3} — so an M1 deployment is unchanged and a full one gains them.
  *
  * Middleware order matters and is deliberate: {@link securityHeaders} is
  * mounted on `*` **first**, so it wraps every response the app can produce —
@@ -277,7 +375,114 @@ export function createApp(deps: AppDeps): App {
   projects.route("/", createTelemetryQuery(deps.query));
   app.route("/v1/projects", projects);
 
+  // 5. M3 surfaces. Each is mounted only when its seam group is supplied, so an
+  //    M1 deployment composes exactly as before and a full deployment gains the
+  //    two-way control plane, events, OTA, admin run and the public dashboard.
+  //    Every group keeps its own contract: the device surfaces authenticate
+  //    themselves (their own `verifyToken`), the run route sits behind the admin
+  //    session gate, and the public read behind the share resolver.
+  mountM3(app, deps);
+
   return app;
+}
+
+/**
+ * Mount the M3 route groups a deploy has supplied, in the frozen order.
+ *
+ * Kept as its own function (rather than inlined above) so the composition reads
+ * as "M1 wiring, then M3 wiring" and each group's mount path and gate are
+ * visible in one place. Nothing here re-implements a module: each call passes
+ * the injected seams straight through, and the module owns the wire contract.
+ *
+ * Paths, exactly as the spec fixes them (§5.2/§6):
+ *   * `GET  /v1/ota`                          — offer (device bearer)
+ *   * `GET  /v1/ota/image`                    — image stream (device bearer)
+ *   * `GET  /v1/control` + `POST /v1/control/ack` — downlink (device bearer)
+ *   * `GET  /v1/control/ws`                   — socket transport (same seam)
+ *   * `POST /v1/events`                       — discrete event (device bearer)
+ *   * `POST /v1/admin/projects/:proj/automations/:id/run` — behind the admin gate
+ *   * `GET  /v1/public/dashboards/:token`     — allow-list-filtered public read
+ */
+function mountM3(app: App, deps: AppDeps): void {
+  const m3 = deps.m3;
+  if (m3 === undefined) return;
+
+  // --- OTA (A18b/A18c) ------------------------------------------------------
+  // The offer sits at `/v1/ota` and the image at `/v1/ota/image`. Hono resolves
+  // the more specific path first, so mounting both under the `/v1/ota` family
+  // cannot shadow the image route.
+  if (m3.ota !== undefined) {
+    app.route("/v1/ota/image", createOtaImage(m3.ota.image));
+    app.route("/v1/ota", createOtaOffer(m3.ota.offer));
+  }
+
+  // --- Control (A19/A20) ----------------------------------------------------
+  // One control plane + verifier feed both transports; the socket is optional.
+  if (m3.control !== undefined) {
+    app.route(
+      "/v1/control",
+      createControl({
+        control: m3.control.plane,
+        verifyToken: m3.control.verifyToken,
+        scopeToDevice: m3.control.scopeToDevice,
+      } satisfies ControlDeps),
+    );
+    if (m3.control.ws !== undefined) {
+      // The socket router owns `/` under its own sub-tree so the HTTP handlers
+      // at `/v1/control` and `/v1/control/ack` are untouched.
+      const ws = new Hono();
+      ws.route(
+        "/",
+        createControlWs({
+          control: m3.control.plane,
+          verifyToken: m3.control.verifyToken,
+          runtime: m3.control.ws,
+          scopeToDevice: m3.control.scopeToDevice,
+        } satisfies ControlWsDeps),
+      );
+      app.route("/v1/control/ws", ws);
+    }
+  }
+
+  // --- Events (A21b) --------------------------------------------------------
+  if (m3.events !== undefined) {
+    app.route(
+      "/v1/events",
+      createEvents({ verifyToken: m3.events.verifyToken, dispatch: m3.events.dispatch }),
+    );
+  }
+
+  // --- Admin manual-run (A21c) ---------------------------------------------
+  // Mounted under `/v1/admin/projects` behind the shared session gate, so a
+  // missing/unknown session is a fail-closed `401` and a `:proj` claim that
+  // contradicts the session is `403` — before the handler runs.
+  if (m3.manualRun !== undefined) {
+    const admin = new Hono();
+    admin.use("/:proj/automations/:id/run", resolveAdminProject(m3.manualRun.credentials));
+    admin.route("/", createManualRun({ ...m3.manualRun.deps }));
+    app.route("/v1/admin/projects", admin);
+  }
+
+  // --- Public dashboard (A24) ----------------------------------------------
+  // A share token in the path resolves to an allow-listed view; the snapshot is
+  // the projection filtered by the layout the share names. A refusal is the
+  // module's own typed error mapped to its frozen status (404 for no usable
+  // share, 401 for an attempted write — never a `500`).
+  if (m3.publicDashboard !== undefined) {
+    const dashboard = new PublicDashboardService(m3.publicDashboard);
+    app.get("/v1/public/dashboards/:token", async (c) => {
+      try {
+        const view = await dashboard.resolve(c.req.param("token"));
+        const points = await view.snapshot();
+        return c.json({ variables: view.variables, points }, 200);
+      } catch (err) {
+        if (isPublicDashboardError(err)) {
+          return c.json(err.toBody(), err.status as 401 | 404);
+        }
+        throw err;
+      }
+    });
+  }
 }
 
 /**

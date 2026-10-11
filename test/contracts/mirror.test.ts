@@ -333,10 +333,10 @@ describe("mirror: OTA route shape agrees with ota-lock.ts", () => {
     expect(OTA_IMAGE.rateLimited.header).toBe("retry-after");
   });
 
-  it("both routes are marked not implemented on both sides", () => {
-    expect(routes.map((r) => r.implemented)).toEqual([false, false]);
-    expect(OTA_OFFER.implemented).toBe(false);
-    expect(OTA_IMAGE.implemented).toBe(false);
+  it("both routes are marked implemented on both sides (M3)", () => {
+    expect(routes.map((r) => r.implemented)).toEqual([true, true]);
+    expect(OTA_OFFER.implemented).toBe(true);
+    expect(OTA_IMAGE.implemented).toBe(true);
   });
 
   it("the image route's 429/404 statuses agree with the frozen lock", () => {

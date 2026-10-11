@@ -7,10 +7,9 @@
  * their shape so a pair of suites across two repos can assert against ONE
  * description:
  *
- *   * `insight/test/contracts/ota-contract.test.ts`   — mounts what the server
- *     actually exposes today and asserts the OTA shape EXACTLY; where a route
- *     is not implemented yet it asserts only the frozen shape / the route's
- *     ABSENCE, never an invented route.
+ *   * `insight/test/contracts/ota-contract.test.ts`   — drives the REAL composed
+ *     app (`createApp` with the OTA seam group) and asserts the OTA shape
+ *     EXACTLY, including that both routes are wired.
  *   * `insight/test/contracts/mirror.test.ts`         — parses the SDK's C++
  *     mirror (`insight-sdk/test/test_contract/test_main.cpp`, namespace
  *     `contract`) TEXTUALLY and asserts these same frozen values, so a
@@ -22,9 +21,8 @@
  *   * Field names, header names, media types, status codes and the retry
  *     parameter are the CONTRACT. Changing any value here MUST break the mirror
  *     guard (that is the point — this file is a tripwire).
- *   * Where the route does not exist yet, the shape is STILL recorded and
- *     clearly marked `implemented: false` (spec §6.4/§6.5; M3 tickets A18b /
- *     A18c). Never invent a server route to satisfy a shape.
+ *   * Both OTA routes are wired as of M3 (tickets A18b / A18c), so
+ *     `implemented` is `true` on both sides; the SDK mirror must agree.
  *
  * The values that overlap `contract-lock.ts` (`GET_OTA`, `STATUS`,
  * `CONTRACT_HEADERS`, `OTA_RESPONSE_FIELDS`, `OTA_UPDATE_FIELDS`) are re-exported
@@ -60,15 +58,15 @@ export const OTA_SHA256_HEX_LENGTH = 64;
  *   * `200 {update: null}`                       — device is current.
  *   * `200 {update: {version,size,sha256,url}}`   — a newer firmware exists.
  *
- * `implemented: false` today (M3 ticket A18b): no `/v1/ota` Hono route is
- * wired in `worker/src/app.ts`, so `ota-contract.test.ts` asserts only this
- * shape and the route's absence — it never fabricates one. When A18b lands,
- * only `implemented` flips; the frozen fields below do not move.
+ * `implemented: true` (M3 ticket A18b): `GET /v1/ota` is now wired in
+ * `worker/src/app.ts` (mounted through `AppDeps.m3.ota`), so
+ * `ota-contract.test.ts` drives the live route and asserts this shape. The
+ * frozen fields below did not move when the flag flipped.
  */
 export const OTA_OFFER = {
   method: "GET",
   path: "/v1/ota",
-  implemented: false, // M3 / A18b
+  implemented: true, // M3 / A18b — wired in app.ts
   auth: "project-token (bearer)",
   /** The request header carrying the running firmware version. */
   requestHeader: CONTRACT_HEADERS.firmware,
@@ -97,15 +95,16 @@ export const OTA_OFFER = {
  *   * `429` + `retry-after` header   — per-device/hour quota exhausted (D2.8).
  *   * `404`                          — the image was deleted / does not exist.
  *
- * `implemented: false` today (M3 ticket A18c): no `/v1/ota/image` Hono route
- * exists, so `ota-contract.test.ts` asserts only this shape and the route's
- * absence. The `x-insight-firmware` header rides the whole `/v1/ota` path
- * family (the SDK attaches it by prefix — see `InsightDevice.h`).
+ * `implemented: true` (M3 ticket A18c): `GET /v1/ota/image` is now wired in
+ * `worker/src/app.ts` (mounted through `AppDeps.m3.ota`), so
+ * `ota-contract.test.ts` drives the live route. The `x-insight-firmware` header
+ * rides the whole `/v1/ota` path family (the SDK attaches it by prefix — see
+ * `InsightDevice.h`).
  */
 export const OTA_IMAGE = {
   method: "GET",
   path: "/v1/ota/image",
-  implemented: false, // M3 / A18c
+  implemented: true, // M3 / A18c — wired in app.ts
   auth: "project-token (bearer)",
   requestHeader: CONTRACT_HEADERS.firmware,
   /** Success status + the exact media type of the body. */
@@ -127,7 +126,7 @@ export const OTA_IMAGE = {
 // Convenience aggregate
 // ---------------------------------------------------------------------------
 
-/** All OTA routes this lock covers (both pending until M3). */
+/** All OTA routes this lock covers (both wired into `createApp` as of M3). */
 export const OTA_ROUTES = {
   offer: OTA_OFFER,
   image: OTA_IMAGE,

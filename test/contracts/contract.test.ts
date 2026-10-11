@@ -7,15 +7,18 @@
  *
  *   * `POST /v1/telemetry` — ingest route  in `worker/src/domains/telemetry/telemetry.ts`
  *   * `POST /v1/telemetry` (validation)    in `worker/src/domains/telemetry/validate-route.ts`
- *   * `GET /v1/ota` / `GET /v1/control`    NOT implemented server-side yet (M3 / A18)
+ *   * `GET /v1/ota` / `GET /v1/control` / `POST /v1/control/ack` — LIVE (M3), mounted
+ *     through `createApp` once `AppDeps.m3` supplies their seam groups
  *
  * The live assertions use the constants themselves for BOTH the request and the
  * expected value, so editing a field name, status or error code in
  * `contract-lock.ts` makes the request/expectation disagree with the unchanged
  * server and the suite FAILS. That is the load-bearing tripwire.
  *
- * Anything the server does not implement yet is asserted as *absent* (a 404
- * probe), never by inventing a route.
+ * Anything the server has not wired is asserted as *absent* (a 404 probe),
+ * never by inventing a route. Since M3 wired the OTA and control surfaces, the
+ * M3 block below asserts they are PRESENT — a mounted route whose module-owned
+ * auth answers its own `401` (not the framework's `404`).
  */
 
 import { describe, expect, it } from "vitest";
@@ -31,6 +34,14 @@ import { postTelemetryValidated } from "../../worker/src/domains/telemetry/valid
 import { RateLimiter } from "../../worker/src/domains/telemetry/rate-limit";
 import { AUTHORIZATION_HEADER } from "../../worker/src/domains/telemetry/query";
 import { DEFAULT_LIMITS } from "../../worker/src/shared/validation";
+import {
+  InMemoryProjectControlStorage,
+  ProjectControl,
+} from "../../worker/src/platform/durable-objects/project-control";
+import {
+  InMemoryFirmwareRepo,
+  InMemoryImageStore,
+} from "../../worker/src/domains/firmware/upload";
 import {
   CONTRACT_ERRORS,
   CONTRACT_HEADERS,
@@ -149,6 +160,65 @@ function composedApp(): App {
   return createApp(deps);
 }
 
+/**
+ * The REAL composed production surface with the M3 seam groups supplied.
+ *
+ * This is the app M3 wired: `createApp` mounts the OTA, control and events
+ * routers because `deps.m3` carries their seams. Driving this app — rather than
+ * a route-less stub — is what makes the PRESENCE probes below meaningful: a
+ * mounted route answers its own module-owned `401` for an anonymous request,
+ * whereas an unmounted one is the framework's `404`.
+ *
+ * The seams are the modules' own in-memory fakes; the same `ProjectControl`
+ * backs both the HTTP and socket transports, exactly as a deploy wires them.
+ */
+function composedM3App(): App {
+  const control = new ProjectControl({
+    storage: new InMemoryProjectControlStorage(),
+    now: () => 1_700_000_000_000,
+  });
+  const firmware = new InMemoryFirmwareRepo();
+  const images = new InMemoryImageStore();
+  const device = async (token: string) =>
+    token === TOKEN ? { kind: "device" as const, projectId: PROJECT, scopes: "read write" } : null;
+
+  const deps: AppDeps = {
+    deviceTokens: device,
+    sessions: async () => null,
+    ingest: {
+      verifyToken: device,
+      sink: { record: async () => undefined },
+      devices: { register: () => undefined, has: () => false },
+    },
+    query: {
+      credentials: async () => null,
+      projects: { state: async () => [] },
+      shards: { ring: async () => [] },
+    },
+    m3: {
+      ota: {
+        offer: {
+          firmware,
+          targets: { assigned: async () => null, latest: async () => null },
+          verifyToken: device,
+        },
+        image: {
+          images: { get: async (key) => images.get(key) ?? null },
+          firmware: {
+            findKey: async (projectId, version) =>
+              (await firmware.find(projectId, version))?.r2Key ?? null,
+          },
+          quota: { consume: async () => ({ allowed: true as const }) },
+          verifyToken: device,
+        },
+      },
+      control: { plane: control, verifyToken: device },
+      events: { verifyToken: device, dispatch: () => undefined },
+    },
+  };
+  return createApp(deps);
+}
+
 // ---------------------------------------------------------------------------
 // Lock self-consistency
 // ---------------------------------------------------------------------------
@@ -234,9 +304,9 @@ describe("contract-lock self-consistency", () => {
     // so the flag that once marked it shape-only (M3/A18) is flipped true. The
     // SDK mirror must agree (see mirror.test.ts).
     expect(CONTRACT_ERRORS.rate_limited.implemented).toBe(true);
-    expect(GET_OTA.implemented).toBe(false); // M3 / A18
-    expect(GET_CONTROL.implemented).toBe(false);
-    expect(POST_CONTROL_ACK.implemented).toBe(false);
+    expect(GET_OTA.implemented).toBe(true); // M3 / A18b — wired
+    expect(GET_CONTROL.implemented).toBe(true); // M3 / A19 — wired
+    expect(POST_CONTROL_ACK.implemented).toBe(true); // M3 / A19 — wired
   });
 
   it("pins the authorization header to the lock's lowercase spelling (SDK drift regression)", () => {
@@ -450,20 +520,18 @@ describe("POST /v1/telemetry (validation-only route)", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Not-yet-implemented surfaces — asserted ABSENT, never invented
+// M3 surfaces — asserted PRESENT in the composed app (they were wired in M3)
 // ---------------------------------------------------------------------------
 
-describe("not-yet-implemented surfaces (M3 / A18)", () => {
-  // Probes below drive the REAL composed app, never a bare `new Hono()`. A bare
-  // Hono 404s every path unconditionally, so it would pass even if these routes
-  // were wired; `createApp(fakeDeps)` mounts the real middleware + routers, so
-  // a wired `/v1/ota` (or control) route makes the probe non-404 and fails.
-  const app = composedApp();
+describe("M3 surfaces are wired into the composed app (A18b, A18c, A19)", () => {
+  // Probes below drive the REAL composed app with the M3 seam groups supplied.
+  // A mounted route answers its own module-owned `401` for an anonymous request;
+  // an unmounted one is the framework's `404`. So these probes observe WIRING:
+  // if a route were removed from `mountM3`, the status would flip to 404 and
+  // fail — the tripwire reversed.
+  const app = composedM3App();
 
   it("POST /v1/telemetry IS wired, so the composed app is not a blanket 404", async () => {
-    // A control: this route exists, and its module-owned auth answers `401`
-    // (not `404`) for an unauthenticated request. It proves the app routes
-    // requests, so the 404s below are about the pending surfaces being unwired.
     const res = await app.request(POST_TELEMETRY.path, {
       method: POST_TELEMETRY.method,
       headers: { "content-type": "application/json" },
@@ -472,8 +540,40 @@ describe("not-yet-implemented surfaces (M3 / A18)", () => {
     expect(res.status).toBe(STATUS.unauthorized);
   });
 
-  it("GET /v1/ota has no live route yet", async () => {
-    expect(GET_OTA.implemented).toBe(false);
+  it("GET /v1/ota IS mounted and answers its own 401 without a credential", async () => {
+    expect(GET_OTA.implemented).toBe(true);
+    const res = await app.request(GET_OTA.path, { method: GET_OTA.method });
+    // Route-owned auth, NOT the framework's 404: the route exists.
+    expect(res.status).toBe(STATUS.unauthorized);
+  });
+
+  it("GET /v1/control IS mounted and answers its own 401 without a credential", async () => {
+    expect(GET_CONTROL.implemented).toBe(true);
+    const res = await app.request(GET_CONTROL.path, { method: GET_CONTROL.method });
+    expect(res.status).toBe(STATUS.unauthorized);
+  });
+
+  it("POST /v1/control/ack IS mounted and answers its own 401 without a credential", async () => {
+    expect(POST_CONTROL_ACK.implemented).toBe(true);
+    const res = await app.request(POST_CONTROL_ACK.path, {
+      method: POST_CONTROL_ACK.method,
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ [CONTROL_ACK_REQUEST_FIELDS[0]]: ["c_1"] }),
+    });
+    expect(res.status).toBe(STATUS.unauthorized);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Unwired surfaces — still asserted ABSENT when no M3 seam group is supplied
+// ---------------------------------------------------------------------------
+
+describe("OTA/control are absent when the M3 seams are not bound", () => {
+  // The M1-only composed app (`createApp` without `deps.m3`) must NOT grow these
+  // routes: the groups are opt-in, so an M1 deploy composes exactly its surface.
+  const app = composedApp();
+
+  it("GET /v1/ota is not mounted without the OTA seam group", async () => {
     const res = await app.request(GET_OTA.path, {
       method: GET_OTA.method,
       headers: { [CONTRACT_HEADERS.authorization]: `Bearer ${TOKEN}` },
@@ -481,19 +581,8 @@ describe("not-yet-implemented surfaces (M3 / A18)", () => {
     expect(res.status).toBe(STATUS.notFound);
   });
 
-  it("GET /v1/control has no live route yet", async () => {
-    expect(GET_CONTROL.implemented).toBe(false);
+  it("GET /v1/control is not mounted without the control seam group", async () => {
     const res = await app.request(GET_CONTROL.path, { method: GET_CONTROL.method });
-    expect(res.status).toBe(STATUS.notFound);
-  });
-
-  it("POST /v1/control/ack has no live route yet", async () => {
-    expect(POST_CONTROL_ACK.implemented).toBe(false);
-    const res = await app.request(POST_CONTROL_ACK.path, {
-      method: POST_CONTROL_ACK.method,
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ [CONTROL_ACK_REQUEST_FIELDS[0]]: ["c_1"] }),
-    });
     expect(res.status).toBe(STATUS.notFound);
   });
 });
