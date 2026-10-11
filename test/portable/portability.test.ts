@@ -822,7 +822,9 @@ describe("the portable deploy files carry no hardcoded credential", () => {
     // (in an isolated pseudo-file, never the tree) MUST be found — otherwise a
     // green scan below would prove nothing.
     const control = scanForHardcodedSecrets([
-      { path: "<planted>/leak.ts", content: 'const k = "@@PLANTED_STRIPE_CONTROL@@";\n' },
+      // Assembled at runtime so no live-key literal is ever committed; the
+      // scanner still sees the full Stripe-shaped value and must fire.
+      { path: "<planted>/leak.ts", content: `const k = "${["sk", "live", "51H8PLANTEDmarker000000"].join("_")}";\n` },
     ]);
     expect(control.length).toBeGreaterThan(0);
 

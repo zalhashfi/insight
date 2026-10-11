@@ -193,7 +193,8 @@ describe("portability audit — the shipped tree carries no hardcoded credential
     // an isolated pseudo-file (never the tree). If this does not fire, the green
     // scan below means nothing.
     const control = scanForHardcodedSecrets([
-      { path: "<planted>/leak.ts", content: 'const k = "@@PLANTED_STRIPE_CONTROL@@";\n' },
+      // Assembled at runtime so no live-key literal is ever committed.
+      { path: "<planted>/leak.ts", content: `const k = "${["sk", "live", "51H8PLANTEDmarker000000"].join("_")}";\n` },
     ]);
     expect(control.length).toBeGreaterThan(0);
 
