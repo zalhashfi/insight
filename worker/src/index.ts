@@ -19,6 +19,7 @@
  *   POST /v1/events                                -> 204, or 400/401
  *   POST /v1/admin/projects/:proj/automations/:id/run -> 200 { "run": {...} }
  *   GET  /v1/public/dashboards/:token              -> 200 { "variables", "points" }
+ *   GET  /embed/:token                             -> 200 text/html (read-only embed, no login)
  *   GET  /v1/mcp/read + POST /v1/mcp/write         -> 200 { "result" }, or 401/403
  *   GET  /v1/mcp/oauth/.well-known/oauth-authorization-server + POST /v1/mcp/oauth/token
  *   GET  /v1/integrations                          -> 200 { "providers": [...] }

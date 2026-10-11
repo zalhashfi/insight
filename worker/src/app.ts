@@ -29,6 +29,7 @@
  *   | `DELETE /v1/admin/projects/:proj`       | {@link AppDeps.m3}.projectDelete |
  *   | `POST /v1/admin/projects/:proj/firmware`| {@link AppDeps.m3}.firmwareUpload |
  *   | `GET  /v1/public/dashboards/:token` (+ `/stream`) | {@link AppDeps.m3}.publicDashboard |
+ *   | `GET  /embed/:token`             | {@link AppDeps.m3}.publicDashboard |
  *
  * ## Dependencies are injected, never faked
  *
@@ -134,6 +135,7 @@ import {
   isPublicDashboardError,
   type PublicDashboardOptions,
 } from "./domains/dashboards/public";
+import { createEmbedRoute, type EmbedLayout } from "./domains/dashboards/embed";
 import {
   createMcpToolRoutes,
   redactSecrets,
@@ -332,6 +334,16 @@ export interface AppDeps {
      * a variable outside the layout the share names.
      */
     readonly publicDashboard?: PublicDashboardOptions;
+    /**
+     * `GET /embed/:token` (A33/FR-DSH-05) — the read-only HTML embed landing.
+     * It reuses {@link publicDashboard} for resolution (one share, one rule) and
+     * adds only presentation. Optional policy: a deploy may refuse to *frame* a
+     * share the resolver accepts, which becomes a uniform `forbidden` (403) —
+     * distinct from "no such share" (404) and never a leak.
+     */
+    readonly embed?: {
+      readonly allowsEmbed?: (layout: EmbedLayout) => boolean;
+    };
   };
   /**
    * M4 surfaces — the AI layer. Like {@link AppDeps.m3}, every group is
@@ -585,6 +597,7 @@ export function createApp(deps: AppDeps): App {
  *   * `POST /v1/admin/projects/:proj/firmware` — admin OTA upload (413 >8 MiB)
  *   * `GET  /v1/public/dashboards/:token`     — allow-list-filtered public read
  *   * `GET  /v1/public/dashboards/:token/stream` — allow-list-filtered live stream
+ *   * `GET  /embed/:token`                    — allow-list-filtered embed landing (A33)
  */
 function mountM3(app: App, deps: AppDeps): void {
   const m3 = deps.m3;
@@ -743,6 +756,23 @@ function mountM3(app: App, deps: AppDeps): void {
         },
       });
     });
+
+    // --- Embed landing (A33 / FR-DSH-05) ------------------------------------
+    // `/embed/:token` renders the SAME resolved, allow-list-filtered view as an
+    // HTML document for an iframe — read-only, no login. It is built from the
+    // same `publicDashboard` options, so a share has exactly one resolution
+    // rule: the embed adds a presentation, never a second path to the data. An
+    // unusable token is the uniform 404; a share the deploy will not frame is a
+    // 403. Both are JSON refusals, so no page is rendered from a refused share.
+    app.route(
+      "/embed",
+      createEmbedRoute({
+        publicDashboard: m3.publicDashboard,
+        ...(m3.embed?.allowsEmbed !== undefined
+          ? { allowsEmbed: m3.embed.allowsEmbed }
+          : {}),
+      }),
+    );
   }
 }
 
