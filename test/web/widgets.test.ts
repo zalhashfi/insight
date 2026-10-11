@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
 
+// Install the DOM stub BEFORE the widget module is evaluated: `WidgetElement`
+// captures `globalThis.HTMLElement` at class-definition time, so the stub must
+// already be in place or the render path permanently binds to the no-DOM
+// fallback. `dom-stub.ts` itself imports nothing from the widget kit, so this
+// import is side-effect-safe to hoist to the very top.
+import { installDomStub, type StubHTMLElement } from "./dom-stub";
+
 import {
   ChartCore,
   ColorCore,
@@ -16,6 +23,7 @@ import {
   defineCustomElements,
   normalizeVariable,
   type WidgetData,
+  type WidgetElement,
   type WidgetType,
   type WidgetValue,
 } from "../../web/src/widgets/index";
@@ -31,9 +39,10 @@ import {
 /**
  * A13c — dashboard widget kit.
  *
- * Asserts the contract the grid editor (A13d) and the live dashboard build on,
- * entirely through the DOM-free {@link WidgetCore} layer so no browser is
- * required:
+ * Asserts the contract the grid editor (A13d) and the live dashboard build on.
+ * The pure `WidgetCore` layer is driven directly; the **custom-element render
+ * path** is driven through a hand-rolled DOM stub (see `./dom-stub.ts`), so no
+ * browser and no jsdom are required:
  *
  *   1. **The catalog is exactly nine kinds** — value, gauge, chart, map, toggle,
  *      push, slider, color, percent — each with a unique tag that matches its
@@ -42,8 +51,14 @@ import {
  *      `update(value)` is observable on the widget. Updates are *not* allowed to
  *      be ignored: `update` on a bound widget always moves `displayValue`, and a
  *      render is emitted whenever a DOM sink is attached.
- *   3. **Initialising all nine never throws** — including in this non-DOM
- *      environment, where {@link defineCustomElements} is a documented no-op.
+ *   3. **`defineCustomElements()` registers the nine `ins-*` tags** into the
+ *      (stubbed) `customElements` registry, and each registered element —
+ *      instantiated for real — binds its `variable` attribute and mirrors a
+ *      value change into its stubbed `textContent`/attributes. An ignored update
+ *      is a failure.
+ *   4. **Initialising all nine never throws** — including on platforms without a
+ *      `customElements` registry, where {@link defineCustomElements} is a
+ *      documented no-op.
  */
 
 /** The nine expected kinds, in the order the task lists them. */
@@ -374,10 +389,174 @@ describe("initialising all nine", () => {
       /unknown widget type/,
     );
   });
+});
 
-  it("is a no-op when no customElements registry exists (this environment)", () => {
-    expect(typeof customElements).toBe("undefined");
-    expect(() => defineCustomElements()).not.toThrow();
-    expect(defineCustomElements()).toEqual([]);
+// ---------------------------------------------------------------------------
+// Custom-element render path (hand-rolled DOM stub — no jsdom)
+// ---------------------------------------------------------------------------
+
+/**
+ * The stub is installed once at module scope, right after the widget module has
+ * bound its `HTMLElement` base (see `./dom-stub.ts`). Sharing one instance makes
+ * the registry assertions coherent and keeps `elementCtor` usable everywhere.
+ */
+const stub = installDomStub();
+
+/**
+ * The instance shape {@link WidgetElement} presents at runtime: `core` is
+ * populated by the constructor (it is `!`-asserted, not optional), and the DOM
+ * members come from the stub `HTMLElement` the module bound to on import. The
+ * `core` cast is unchecked because the class declares it `!`; no extra shape is
+ * fabricated beyond that attribute's real runtime type.
+ */
+type StubElement = WidgetElement & StubHTMLElement & {
+  core: { variable: string | null; displayValue: unknown };
+};
+
+/**
+ * The registered tag constructors are anonymous subclasses of
+ * {@link WidgetElement}; the compiler only knows them as `CustomElementConstructor`.
+ * A single named cast (with the reason above) keeps the per-case reads checked.
+ */
+function elementCtor(tag: string): new () => StubElement {
+  const ctor = stub.registry.get(tag);
+  if (typeof ctor !== "function") throw new Error(`tag not registered: ${tag}`);
+  return ctor as unknown as new () => StubElement;
+}
+
+/**
+ * One representative value change per kind, plus the exact text the stubbed DOM
+ * must end up showing. Kept explicit (no snapshotting the core) so a broken
+ * render — or a widget that silently drops an update — fails loudly here.
+ *
+ * `attr` is the string the `value` attribute carries (parsed as a number when
+ * numeric, else handed through verbatim); `argv` is the same reading as the
+ * public `update()` argument, where structured kinds can use a tuple/object.
+ * `map` reads a marker rather than a scalar, so the render test seeds it through
+ * the API and only carries a placeholder `attr`.
+ */
+const RENDER_EXPECTATIONS: Readonly<
+  Record<WidgetType, { attr: string; argv: WidgetData; text: string }>
+> = {
+  value: { attr: "42", argv: 42, text: "42" },
+  gauge: { attr: "75", argv: 75, text: "75%" },
+  chart: { attr: "21.5", argv: 21.5, text: "21.5" },
+  map: { attr: "51.5", argv: [51.5, -0.12], text: "51.5, -0.12" },
+  toggle: { attr: "on", argv: "on", text: "on" },
+  push: { attr: "true", argv: true, text: "pressed" },
+  slider: { attr: "55", argv: 55, text: "55" },
+  color: { attr: "#ff8800", argv: "#ff8800", text: "#ff8800" },
+  percent: { attr: "80", argv: 80, text: "80%" },
+};
+
+describe("custom-element render path (DOM stub)", () => {
+  it("installed an HTMLElement global and a recording customElements registry", () => {
+    expect(typeof (globalThis as { HTMLElement?: unknown }).HTMLElement).toBe("function");
+    expect(typeof (globalThis as { customElements?: unknown }).customElements).toBe("object");
+    expect(stub.registry).toBeTypeOf("object");
+  });
+
+  it("defineCustomElements() registers exactly the nine ins-* tags", async () => {
+    const { defineCustomElements: define } = await stub.widgets;
+    const tags = define();
+
+    expect(tags).toHaveLength(9);
+    expect(tags).toEqual(EXPECTED_TYPES.map((type) => `ins-${type}`));
+    expect(stub.tags()).toEqual(tags);
+    expect(Object.keys(stub.registry.definitions).sort()).toEqual([...tags].sort());
+  });
+
+  it("is idempotent: a second call re-registers nothing", async () => {
+    const { defineCustomElements: define } = await stub.widgets;
+    const before = stub.tags().length;
+    const tags = define();
+    expect(tags).toEqual(stub.tags());
+    expect(stub.tags()).toHaveLength(before);
+  });
+
+  it("registers a constructible class per tag, subclassing WidgetElement", async () => {
+    const { WidgetElement } = await stub.widgets;
+    for (const type of EXPECTED_TYPES) {
+      const Ctor = stub.registry.get(`ins-${type}`);
+      expect(Ctor, `ins-${type} must be defined`).toBeTypeOf("function");
+      expect(Object.getPrototypeOf(Ctor)).toBe(WidgetElement);
+    }
+  });
+
+  it("instantiates every element without throwing, reflecting data-widget", () => {
+    for (const type of EXPECTED_TYPES) {
+      const Ctor = elementCtor(`ins-${type}`);
+      expect(() => new Ctor()).not.toThrow();
+
+      const el = new Ctor();
+      expect(el).toBeInstanceOf(stub.HTMLElement); // the real stub base, not the fallback
+      expect(el.getAttribute("data-widget")).toBe(type);
+    }
+  });
+
+  it("routes the variable attribute to the core (reflection happens via bind())", () => {
+    for (const type of EXPECTED_TYPES) {
+      const el = new (elementCtor(`ins-${type}`))();
+
+      el.attributeChangedCallback("variable", null, "  kitchen.temperature  ");
+
+      expect(el.core.variable).toBe("kitchen.temperature");
+
+      // The *attribute* path only binds the core; `bind()` is what reflects the
+      // normalized name back onto the element.
+      el.bind("kitchen.temperature");
+      expect(el.getAttribute("variable")).toBe("kitchen.temperature");
+    }
+  });
+
+  it("reflects a value change into textContent + data-value — an ignored update fails", () => {
+    for (const type of EXPECTED_TYPES) {
+      const el = new (elementCtor(`ins-${type}`))();
+
+      el.attributeChangedCallback("variable", null, "device.var");
+      // Baseline: a bound widget shows its neutral reading, never the update.
+      const before = el.textContent;
+      expect(before).not.toBe(RENDER_EXPECTATIONS[type].text);
+
+      // `map` reads a marker, not a scalar: a bare value attribute leaves its
+      // display untouched (still the placeholder), so it is seeded through the
+      // public API instead — every other kind is driven by the attribute.
+      if (type === "map") {
+        el.update([51.5, -0.12]);
+      } else {
+        el.attributeChangedCallback("value", null, RENDER_EXPECTATIONS[type].attr);
+      }
+
+      // The update reached the core...
+      expect(el.core.displayValue).not.toBeNull();
+      // ...and the DOM: text, mirrored data-value, and a real textContent.
+      expect(el.textContent).toBe(RENDER_EXPECTATIONS[type].text);
+      expect(el.getAttribute("data-value")).toBe(RENDER_EXPECTATIONS[type].text);
+    }
+  });
+
+  it("reacts to the public bind()/update() API the same way as the attributes", () => {
+    for (const type of EXPECTED_TYPES) {
+      const el = new (elementCtor(`ins-${type}`))();
+
+      el.bind("device.var");
+      expect(el.getAttribute("variable")).toBe("device.var");
+
+      el.update(RENDER_EXPECTATIONS[type].argv);
+
+      expect(el.textContent).toBe(RENDER_EXPECTATIONS[type].text);
+      expect(el.getAttribute("data-value")).toBe(RENDER_EXPECTATIONS[type].text);
+    }
+  });
+
+  it("unbinding removes the variable attribute rather than blanking it", () => {
+    const el = new (elementCtor("ins-value"))();
+
+    el.bind("temp");
+    expect(el.getAttribute("variable")).toBe("temp");
+
+    el.bind("   "); // blank -> unbound
+    expect(el.getAttribute("variable")).toBeNull();
+    expect(el.hasAttribute("variable")).toBe(false);
   });
 });
