@@ -118,7 +118,7 @@ function service(options: { layout?: EmbedLayout | null; points?: Point[]; allow
 }
 
 /** The composed real app with the public-dashboard seams bound. */
-function harness(options: { layout?: EmbedLayout | null; points?: Point[]; allowsEmbed?: (l: EmbedLayout) => boolean } = {}): App {
+function harness(options: { layout?: EmbedLayout | null; points?: Point[]; allowsEmbed?: (l: EmbedLayout) => boolean; frameAncestors?: readonly string[] } = {}): App {
   const { shares, layouts, projection } = seams(options);
   return createApp({
     deviceTokens: async () => null,
@@ -133,6 +133,9 @@ function harness(options: { layout?: EmbedLayout | null; points?: Point[]; allow
       projects: { state: async () => [] },
       shards: { ring: async () => [] },
     },
+    ...(options.frameAncestors !== undefined
+      ? { embedFrameAncestors: options.frameAncestors }
+      : {}),
     m3: {
       publicDashboard: {
         shares,
@@ -357,6 +360,55 @@ describe("embed — read-only by construction", () => {
     const view = await new PublicDashboardService({ shares, layouts, projection }).resolve(SHARE_TOKEN);
     expect(view.scope).toBe("read_only");
     expect(view.writable).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 5b. R-W3 — /embed is frameable through the COMPOSED app; other routes are not
+// ---------------------------------------------------------------------------
+
+describe("composed app — /embed framing override", () => {
+  it("the embed response does NOT carry X-Frame-Options: DENY", async () => {
+    const app = harness();
+    const res = await app.request(`${EMBED_PATH}/${SHARE_TOKEN}`);
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Frame-Options")).not.toBe("DENY");
+    // Default deploy (no configured origins): frameable by self only.
+    expect(res.headers.get("X-Frame-Options")).toBe("SAMEORIGIN");
+    const csp = res.headers.get("Content-Security-Policy") ?? "";
+    expect(csp).toContain("frame-ancestors 'self'");
+    expect(csp).not.toContain("frame-ancestors 'none'");
+  });
+
+  it("a configured ancestor list is honoured on the composed embed", async () => {
+    const app = harness({ frameAncestors: ["https://dash.example.com"] });
+    const res = await app.request(`${EMBED_PATH}/${SHARE_TOKEN}`);
+    expect(res.headers.get("Content-Security-Policy")).toContain(
+      "frame-ancestors https://dash.example.com",
+    );
+    expect(res.headers.get("X-Frame-Options")).toBe("");
+  });
+
+  it("a normal composed app route STILL carries the DENY baseline", async () => {
+    const app = harness({ frameAncestors: ["https://dash.example.com"] });
+    const res = await app.request("/healthz");
+
+    expect(res.status).toBe(200);
+    expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+    expect(res.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
+  });
+
+  // MUTATION PROOF at the composition level: this pins that `createApp` mounts
+  // the framing override on `/embed`. If that `app.use("/embed*", ...)` pair is
+  // ever removed, `/embed` reverts to the global DENY and THIS test fails.
+  it("MUTATION: the override lives in createApp — removing it would restore DENY", async () => {
+    const embed = await harness().request(`${EMBED_PATH}/${SHARE_TOKEN}`);
+    const other = await harness().request("/healthz");
+    // Same app, two paths: the framing headers MUST differ, which is only true
+    // because createApp scoped the override to /embed.
+    expect(embed.headers.get("X-Frame-Options")).not.toBe(other.headers.get("X-Frame-Options"));
+    expect(other.headers.get("X-Frame-Options")).toBe("DENY");
   });
 });
 

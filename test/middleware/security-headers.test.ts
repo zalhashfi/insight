@@ -4,6 +4,9 @@ import {
   DEFAULT_CONTENT_SECURITY_POLICY,
   DEFAULT_STRICT_TRANSPORT_SECURITY,
   SECURITY_HEADERS,
+  contentSecurityPolicyForFrames,
+  frameAncestorsValue,
+  frameableHeaders,
   securityHeaders,
 } from "../../worker/src/platform/middleware/security-headers";
 
@@ -241,5 +244,115 @@ describe("securityHeaders middleware", () => {
     const res = await makeApp().request("/ok");
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// R-W3 — the /embed framing override, mutation-proof
+// ---------------------------------------------------------------------------
+
+/**
+ * Build an app that wires the framing override EXACTLY as `createApp` does:
+ * the narrow per-path middleware registered BEFORE the global
+ * `securityHeaders()`, so it is the outer middleware for `/embed` and its
+ * `set` wins on the unwind.
+ *
+ * The `withOverride` flag is the mutation seam: flipping it off mounts only
+ * `securityHeaders()`, which is precisely "the override was removed" — and the
+ * tests below must then fail (embed carries DENY again).
+ */
+function makeFrameableApp(
+  ancestors: readonly string[],
+  withOverride = true,
+) {
+  const app = new Hono();
+  if (withOverride) {
+    const frames = frameableHeaders({ ancestors });
+    app.use("/embed", frames);
+    app.use("/embed/*", frames);
+  }
+  app.use("*", securityHeaders());
+
+  app.get("/embed/:token", (c) => c.text("<!doctype html><p>embed</p>", 200, {
+    "Content-Type": "text/html; charset=utf-8",
+  }));
+  app.get("/ok", (c) => c.json({ ok: true }));
+  return app;
+}
+
+describe("frameableHeaders — the /embed framing override", () => {
+  it("default (no configured origins) makes /embed frameable by self, not DENY", async () => {
+    const res = await makeFrameableApp([]).request("/embed/shr_abc");
+
+    expect(res.status).toBe(200);
+    // The acceptance criterion, by value: DENY must be GONE on /embed.
+    expect(res.headers.get("X-Frame-Options")).not.toBe("DENY");
+    expect(res.headers.get("X-Frame-Options")).toBe("SAMEORIGIN");
+    const csp = res.headers.get("Content-Security-Policy") ?? "";
+    expect(csp).toContain("frame-ancestors 'self'");
+    expect(csp).not.toContain("frame-ancestors 'none'");
+  });
+
+  it("a configured origin list widens frame-ancestors to exactly those origins", async () => {
+    const res = await makeFrameableApp(["https://app.example.com", "https://ops.example.org"])
+      .request("/embed/shr_abc");
+    const csp = res.headers.get("Content-Security-Policy") ?? "";
+
+    expect(csp).toContain("frame-ancestors https://app.example.com https://ops.example.org");
+    // The legacy header is emptied (never DENY), so it cannot contradict the CSP.
+    expect(res.headers.get("X-Frame-Options")).toBe("");
+    // The other directives survive untouched — framing is the ONLY relaxation.
+    expect(csp).toContain("default-src 'self'");
+    expect(csp).toContain("base-uri 'self'");
+  });
+
+  it("a normal app route STILL carries X-Frame-Options: DENY and frame-ancestors 'none'", async () => {
+    const app = makeFrameableApp(["https://app.example.com"]);
+    const res = await app.request("/ok");
+
+    expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+    expect(res.headers.get("Content-Security-Policy")).toBe(DEFAULT_CONTENT_SECURITY_POLICY);
+    // And the rest of the baseline is intact, proving the override is scoped.
+    expect(res.headers.get("Strict-Transport-Security")).toBe(
+      DEFAULT_STRICT_TRANSPORT_SECURITY,
+    );
+    expect(res.headers.get("X-Content-Type-Options")).toBe("nosniff");
+  });
+
+  it("the override is scoped to /embed — a sibling path is still DENY", async () => {
+    const app = makeFrameableApp(["https://app.example.com"]);
+    // A path that merely *starts* with the letters "embed" but is not the
+    // subtree must not inherit the relaxation.
+    app.get("/embeddable", (c) => c.text("x"));
+    const res = await app.request("/embeddable");
+    expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+  });
+
+  // --- MUTATION PROOF ------------------------------------------------------
+  // With the override UNMOUNTED the embed must fall back to DENY. This is the
+  // exact assertion that fails if someone deletes the `app.use` pair in
+  // `createApp` — pinning the override's *presence*, not just its absence.
+  it("MUTATION: without the override, /embed carries DENY again (unmount → this fails)", async () => {
+    const res = await makeFrameableApp([], /* withOverride */ false).request("/embed/shr_abc");
+
+    expect(res.headers.get("X-Frame-Options")).toBe("DENY");
+    expect(res.headers.get("Content-Security-Policy")).toContain("frame-ancestors 'none'");
+  });
+
+  it("frameAncestorsValue never emits a fail-open empty list", () => {
+    // An empty/blank list must collapse to 'self' (a real directive), never to
+    // an empty string a browser would ignore.
+    expect(frameAncestorsValue([])).toBe("'self'");
+    expect(frameAncestorsValue(["  ", ""])).toBe("'self'");
+    expect(frameAncestorsValue([" https://a.example "])).toBe("https://a.example");
+  });
+
+  it("contentSecurityPolicyForFrames keeps the other directives and replaces only frame-ancestors", () => {
+    const csp = contentSecurityPolicyForFrames(["https://a.example"]);
+    expect(csp).toBe(
+      "default-src 'self'; frame-ancestors https://a.example; base-uri 'self'",
+    );
+    // No wildcard can ever appear from the seam.
+    expect(csp).not.toContain("frame-ancestors *");
   });
 });

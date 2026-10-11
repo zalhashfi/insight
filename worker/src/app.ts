@@ -28,6 +28,7 @@
  *   | `POST /v1/admin/projects/:proj/automations/:id/run` | {@link AppDeps.m3}.manualRun |
  *   | `DELETE /v1/admin/projects/:proj`       | {@link AppDeps.m3}.projectDelete |
  *   | `POST /v1/admin/projects/:proj/firmware`| {@link AppDeps.m3}.firmwareUpload |
+ *   | `POST /v1/admin/projects/:proj/devices/import` | {@link AppDeps.m3}.deviceImport |
  *   | `GET  /v1/public/dashboards/:token` (+ `/stream`) | {@link AppDeps.m3}.publicDashboard |
  *   | `GET  /embed/:token`             | {@link AppDeps.m3}.publicDashboard |
  *
@@ -131,6 +132,10 @@ import {
   type ProjectDeleteRouteDeps,
 } from "./domains/projects/delete-route";
 import {
+  createDeviceImportRoute,
+  type DeviceImportRouteDeps,
+} from "./domains/devices/import-route";
+import {
   PublicDashboardService,
   isPublicDashboardError,
   type PublicDashboardOptions,
@@ -171,7 +176,7 @@ import {
   type PollResult,
   type TelemetrySinkLike,
 } from "./domains/external/poll";
-import { securityHeaders } from "./platform/middleware/security-headers";
+import { securityHeaders, frameableHeaders } from "./platform/middleware/security-headers";
 import {
   resolveAdminProject,
   resolveDeviceProject,
@@ -328,6 +333,17 @@ export interface AppDeps {
       readonly credentials: CredentialLookup;
     };
     /**
+     * `POST /v1/admin/projects/:proj/devices/import` — the bulk device import
+     * (A34/FR-DEV-06). Mounted on the `/v1/admin/projects` subtree behind
+     * {@link resolveAdminProject}; the handler additionally enforces
+     * `project:update` (admin+) through the membership table, and the import
+     * service's own `413` covers an oversize body (checked before lexing).
+     */
+    readonly deviceImport?: {
+      readonly deps: DeviceImportRouteDeps;
+      readonly credentials: CredentialLookup;
+    };
+    /**
      * `GET /v1/public/dashboards/:token` and `.../stream` — the
      * allow-list-filtered public read and its live stream. A share token is
      * resolved by {@link PublicDashboardService}; neither response ever carries
@@ -454,6 +470,20 @@ export interface AppDeps {
   };
   /** Version identity served at `GET /v1/version`. */
   readonly version?: VersionInfo;
+  /**
+   * Origins allowed to frame the `/embed/:token` surface, matched against CSP
+   * `frame-ancestors`. This is the deploy-configurable framing seam: the
+   * baseline hardening ({@link securityHeaders}) denies framing everywhere
+   * (`X-Frame-Options: DENY` + `frame-ancestors 'none'`), and the `/embed`
+   * subtree is the ONE place that is relaxed — by exactly the origins listed
+   * here. Omitted or empty ⇒ the embed is frameable by its own origin only
+   * (`frame-ancestors 'self'` + `X-Frame-Options: SAMEORIGIN`); a deploy that
+   * hosts the dashboard on another origin lists it here. Never a wildcard.
+   *
+   * The override applies only when the public-dashboard seam (which mounts
+   * `/embed`) is supplied; a deploy without it keeps DENY on `/embed` too.
+   */
+  readonly embedFrameAncestors?: readonly string[];
 }
 
 // ---------------------------------------------------------------------------
@@ -485,11 +515,16 @@ export type App = Hono<{ Variables: AppVariables }>;
  * composed only when {@link AppDeps.m3} supplies their seam groups — see
  * {@link mountM3} — so an M1 deployment is unchanged and a full one gains them.
  *
- * Middleware order matters and is deliberate: {@link securityHeaders} is
- * mounted on `*` **first**, so it wraps every response the app can produce —
- * including the `401` its own gate returns, the framework's `404` for an
- * unknown path, and any `500` from `onError`. Being outermost, it also wraps
- * the bodies of the two routers mounted below.
+ * Middleware order matters and is deliberate. The `/embed` framing override
+ * ({@link frameableHeaders}) is mounted on that narrow subtree **first**, so it
+ * is the outermost middleware there and — because both it and
+ * {@link securityHeaders} write after `await next()` — its `set` wins on the
+ * unwind. {@link securityHeaders} is then mounted on `*`, wrapping every other
+ * response the app can produce — including the `401` its own gate returns, the
+ * framework's `404` for an unknown path, and any `500` from `onError`. The
+ * result: `/embed/:token` is frameable by the configured origins, while every
+ * other path keeps the `X-Frame-Options: DENY` / `frame-ancestors 'none'`
+ * baseline.
  *
  * @throws TypeError when a required dependency is missing or malformed. This is
  *   a composition-time failure at the edge, not a runtime `500`: it is the
@@ -502,15 +537,28 @@ export function createApp(deps: AppDeps): App {
   // the variables here keeps those `c.set`/`c.get` calls typed.
   const app = new Hono<{ Variables: AppVariables }>();
 
-  // 1. Hardening first, on the widest pattern, so nothing can outrun it.
+  // 1. Framing exception FIRST, on the narrow `/embed` subtree only, so it is
+  //    the OUTERMOST middleware for that path. Both this and `securityHeaders`
+  //    write after `await next()`, so the outer one unwinds last and wins: the
+  //    embed ends up frameable while every other path keeps the DENY default.
+  //    Mounted only when the embed surface is actually composed, so an M1-only
+  //    deploy keeps DENY even on `/embed`.
+  if (deps.m3?.publicDashboard !== undefined) {
+    const frames = frameableHeaders({ ancestors: deps.embedFrameAncestors ?? [] });
+    app.use("/embed", frames);
+    app.use("/embed/*", frames);
+  }
+
+  // 2. Hardening next, on the widest pattern: it wraps everything but the
+  //    `/embed` framing override above.
   app.use("*", securityHeaders());
 
-  // 2. Liveness + identity — no auth, no seams, constant responses.
+  // 3. Liveness + identity — no auth, no seams, constant responses.
   app.get("/healthz", (c) => c.json({ ok: true }, 200));
   const version = deps.version ?? DEFAULT_VERSION;
   app.get("/v1/version", (c) => c.json({ name: version.name, version: version.version }, 200));
 
-  // 3. Device ingress. The ingest router is the single authority for every
+  // 4. Device ingress. The ingest router is the single authority for every
   //    ingest decision, including the credential verdict. The frozen contract
   //    for `POST /v1/telemetry` (`POST_TELEMETRY.errors`) names `unauthorized`
   //    — for a missing token AND for a presented-but-rejected one — and never
@@ -552,7 +600,7 @@ export function createApp(deps: AppDeps): App {
     }),
   );
 
-  // 4. Read surface. The router owns `:proj`; the middleware is mounted on the
+  // 5. Read surface. The router owns `:proj`; the middleware is mounted on the
   //    sub-tree so a path claim that disagrees with the credential is refused
   //    fail-closed before any read.
   const projectsResolver = { deviceTokens: deps.deviceTokens, sessions: deps.sessions };
@@ -561,7 +609,7 @@ export function createApp(deps: AppDeps): App {
   projects.route("/", createTelemetryQuery(deps.query));
   app.route("/v1/projects", projects);
 
-  // 5. M3 surfaces. Each is mounted only when its seam group is supplied, so an
+  // 6. M3 surfaces. Each is mounted only when its seam group is supplied, so an
   //    M1 deployment composes exactly as before and a full deployment gains the
   //    two-way control plane, events, OTA, admin run and the public dashboard.
   //    Every group keeps its own contract: the device surfaces authenticate
@@ -569,7 +617,7 @@ export function createApp(deps: AppDeps): App {
   //    session gate, and the public read behind the share resolver.
   mountM3(app, deps);
 
-  // 6. M4 surfaces — the AI layer. Mounted only when their seam groups are
+  // 7. M4 surfaces — the AI layer. Mounted only when their seam groups are
   //    supplied, exactly like M3, so an M1–M3 deploy composes unchanged. The
   //    MCP bridge sits behind its bearer gate + write flag; the integrations,
   //    anomaly hook and external poll are wired to the injected seams they own.
@@ -595,6 +643,7 @@ export function createApp(deps: AppDeps): App {
  *   * `POST /v1/admin/projects/:proj/automations/:id/run` — behind the admin gate
  *   * `DELETE /v1/admin/projects/:proj`       — owner-only project delete
  *   * `POST /v1/admin/projects/:proj/firmware` — admin OTA upload (413 >8 MiB)
+ *   * `POST /v1/admin/projects/:proj/devices/import` — admin bulk import (413 >cap)
  *   * `GET  /v1/public/dashboards/:token`     — allow-list-filtered public read
  *   * `GET  /v1/public/dashboards/:token/stream` — allow-list-filtered live stream
  *   * `GET  /embed/:token`                    — allow-list-filtered embed landing (A33)
@@ -684,6 +733,21 @@ function mountM3(app: App, deps: AppDeps): void {
       createFirmwareUploadRoute({
         ...m3.firmwareUpload.deps,
         credentials: m3.firmwareUpload.credentials,
+      }),
+    );
+  }
+
+  // --- Admin device import (A34) -------------------------------------------
+  // Admin+. The shared session gate pins the principal and matches `:proj`,
+  // then the handler enforces `project:update` (admin+) before any bytes are
+  // read; the import service's own `payload_too_large` (413) covers an oversize
+  // body, checked BEFORE the body is lexed so a huge upload is never walked.
+  if (m3.deviceImport !== undefined) {
+    app.route(
+      "/v1/admin/projects",
+      createDeviceImportRoute({
+        ...m3.deviceImport.deps,
+        credentials: m3.deviceImport.credentials,
       }),
     );
   }
@@ -1026,6 +1090,16 @@ function assertDeps(deps: AppDeps): void {
   // M4 groups are optional, but a *supplied* one must be structurally sound —
   // the same "fail loudly at the edge, not silently degrade" rule. Only the
   // groups whose absence would mount an unsafe or broken surface are checked.
+  check(
+    deps?.m3?.deviceImport === undefined ||
+      typeof deps.m3.deviceImport.deps?.imports?.importDevices === "function",
+    "m3.deviceImport.deps.imports",
+  );
+  check(
+    deps?.m3?.deviceImport === undefined ||
+      typeof deps.m3.deviceImport.credentials?.sessions === "function",
+    "m3.deviceImport.credentials",
+  );
   check(
     deps?.m4?.mcp === undefined || (typeof deps.m4.mcp.tools === "object" && deps.m4.mcp.tools !== null),
     "m4.mcp.tools",

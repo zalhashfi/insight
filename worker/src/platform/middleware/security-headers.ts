@@ -103,4 +103,94 @@ export function securityHeaders(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Framing override — the one sanctioned relaxation of the baseline
+// ---------------------------------------------------------------------------
+
+/**
+ * CSP `frame-ancestors` value for an allowed-origin list.
+ *
+ * An empty list collapses to `'self'` — the minimally-permissive *useful*
+ * default: the embed may be framed by its own origin, and by nothing else. It
+ * is never a wildcard and never a bare `frame-ancestors ` (which a browser
+ * treats as "ignore", i.e. fail-open). A deploy widens it by supplying the
+ * origins it actually trusts to iframe the board.
+ */
+export function frameAncestorsValue(origins: readonly string[]): string {
+  const cleaned = origins.map((o) => o.trim()).filter((o) => o.length > 0);
+  return cleaned.length > 0 ? cleaned.join(" ") : "'self'";
+}
+
+/**
+ * Build the CSP value that replaces {@link DEFAULT_CONTENT_SECURITY_POLICY} on
+ * a frameable subtree: the same baseline directives, with `frame-ancestors`
+ * widened to `origins`. The other directives are preserved verbatim, so a
+ * relaxation of framing never quietly loosens `default-src`/`base-uri`.
+ */
+export function contentSecurityPolicyForFrames(origins: readonly string[]): string {
+  return DEFAULT_CONTENT_SECURITY_POLICY.replace(
+    /frame-ancestors[^;]*/,
+    `frame-ancestors ${frameAncestorsValue(origins)}`,
+  );
+}
+
+/** Options for {@link frameableHeaders}. */
+export interface FrameableOptions {
+  /**
+   * Origins allowed to frame the subtree, matched against CSP
+   * `frame-ancestors`. The value is the deploy-configurable seam: pass the
+   * dashboard host(s) that will iframe the embed (e.g.
+   * `["https://app.example.com"]`). An empty list (the default) yields the
+   * baseline `'none'` — same-origin framing only if the browser's default
+   * applies, never a wildcard.
+   */
+  readonly ancestors?: readonly string[];
+}
+
+/**
+ * Hono middleware that makes a subtree *frameable* by the configured origins.
+ *
+ * `securityHeaders()` denies framing everywhere (`X-Frame-Options: DENY` +
+ * CSP `frame-ancestors 'none'`), which blocks the read-only `/embed/:token`
+ * surface the product intends to be iframed. This middleware is the surgical
+ * exception: it rewrites ONLY the two framing headers, leaving every other
+ * hardening header untouched.
+ *
+ * ## Why it must be mounted OUTSIDE `securityHeaders()`
+ *
+ * Both middlewares write after `await next()`, so the OUTER one unwinds last
+ * and its `set` wins. To override the baseline, this middleware must be
+ * registered on the subtree pattern BEFORE `app.use("*", securityHeaders())`,
+ * i.e. it is the outer middleware for that path:
+ *
+ * ```ts
+ * app.use("/embed/*", frameableHeaders({ ancestors }));   // outer (per-path)
+ * app.use("*", securityHeaders());                        // inner (global)
+ * ```
+ *
+ * Every other path matches only `securityHeaders`, so the DENY default is
+ * intact there. Removing this mount restores `X-Frame-Options: DENY` on
+ * `/embed` — which is exactly the mutation a test pins.
+ */
+export function frameableHeaders(options: FrameableOptions = {}): MiddlewareHandler {
+  const ancestors = (options.ancestors ?? [])
+    .map((o) => o.trim())
+    .filter((o) => o.length > 0);
+  const csp = contentSecurityPolicyForFrames(ancestors);
+  // `X-Frame-Options` has no origin-list form (only DENY/SAMEORIGIN). When
+  // specific ancestors are configured, CSP is the real control; emitting
+  // `SAMEORIGIN` would contradict it, so the header is emitted EMPTY — present
+  // but ignored by modern browsers — and CSP governs framing. With no
+  // configured ancestors the policy is self-only, so `SAMEORIGIN` states
+  // exactly that in the legacy header too.
+  const xfo = ancestors.length > 0 ? "" : "SAMEORIGIN";
+
+  return async function frameableHeadersMiddleware(c, next) {
+    await next();
+
+    c.res.headers.set("Content-Security-Policy", csp);
+    c.res.headers.set("X-Frame-Options", xfo);
+  };
+}
+
 export default securityHeaders;

@@ -68,27 +68,38 @@ import {
   type Device,
   type DeviceStatus,
 } from "./metadata";
+import { byteLength } from "../../shared/validation";
 
 // ---------------------------------------------------------------------------
 // Options & limits
 // ---------------------------------------------------------------------------
 
 /**
- * Tunable limits for an import. Both are *productivity* guards, not storage
- * limits: they bound the work a single request may do (and the size of the
- * report) so one oversized sheet cannot pin the worker. A batch that exceeds
+ * Tunable limits for an import. All three are *resource* guards, not storage
+ * limits: they bound the work a single request may do — the bytes it may lex
+ * (`maxBytes`), the rows it may process (`maxRows`) and the size of the report
+ * it returns (`maxMessageLength`) — so one oversized sheet cannot pin the
+ * worker. A body over `maxBytes` is refused before lexing; a batch over
  * `maxRows` is refused wholesale (`too_many_rows`) — a half-imported sheet is
  * less useful than a clear "split this file" answer.
  */
 export interface DeviceImportLimits {
+  /**
+   * Maximum byte length (UTF-8) of one import body. This is a *lexing* guard,
+   * checked against `input.data` BEFORE any parsing, so a huge upload is
+   * refused (`payload_too_large`, 413) rather than fully walked: a multi-GB CSV
+   * must not be scanned character-by-character to discover it is too big.
+   */
+  readonly maxBytes: number;
   /** Maximum number of data rows in one import. */
   readonly maxRows: number;
   /** Maximum characters in one report message (rows are elided past this). */
   readonly maxMessageLength: number;
 }
 
-/** Default import limits: 1000 rows, 500-character reasons. */
+/** Default import limits: 8 MiB body, 1000 rows, 500-character reasons. */
 export const DEFAULT_IMPORT_LIMITS: DeviceImportLimits = {
+  maxBytes: 8 * 1024 * 1024,
   maxRows: 1_000,
   maxMessageLength: 500,
 };
@@ -334,7 +345,8 @@ export type DeviceImportErrorCode =
   | "invalid_input"
   | "invalid_format"
   | "empty_import"
-  | "too_many_rows";
+  | "too_many_rows"
+  | "payload_too_large";
 
 /** Lookup of a {@link DeviceImportErrorCode} onto an HTTP status. */
 export const DEVICE_IMPORT_STATUS: Record<DeviceImportErrorCode, number> = {
@@ -342,6 +354,7 @@ export const DEVICE_IMPORT_STATUS: Record<DeviceImportErrorCode, number> = {
   invalid_format: 400,
   empty_import: 400,
   too_many_rows: 413,
+  payload_too_large: 413,
 };
 
 /**
@@ -583,6 +596,18 @@ export class DeviceImportService {
   /** Lex the body into raw rows, or throw `invalid_format`/`empty_import`. */
   #parse(input: ImportDevicesInput): RawDeviceRow[] {
     const data = input.data;
+
+    // Size gate FIRST — before any lexing. A body over `maxBytes` is refused
+    // whole (`payload_too_large`, 413) so a huge upload is never walked
+    // character-by-character. Mirrors `checkSize` in `shared/validation.ts`,
+    // which likewise runs before the payload is parsed.
+    if (typeof data === "string" && byteLength(data) > this.#limits.maxBytes) {
+      throw new DeviceImportError(
+        "payload_too_large",
+        `import body exceeds ${this.#limits.maxBytes} bytes`,
+      );
+    }
+
     if (typeof data !== "string" || data.trim().length === 0) {
       throw new DeviceImportError("empty_import", "import body is empty");
     }

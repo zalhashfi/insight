@@ -77,6 +77,9 @@ import type { CredentialResolver } from "./domains/telemetry/query";
  *                       (tools + gate + OAuth), the integrations egress surface,
  *                       the anomaly notification hook and external polling.
  *                       Same rule: an absent group leaves its surface absent.
+ *   - `embedFrameAncestors` — the deploy-configurable framing allowlist for the
+ *                       read-only `/embed/:token` surface; omit it and the embed
+ *                       is frameable by its own origin only.
  */
 export interface BindingAdapters {
   readonly deviceTokens: DeviceTokenResolver;
@@ -96,6 +99,13 @@ export interface BindingAdapters {
   readonly m4?: AppDeps["m4"];
   /** Advertised build identity; defaults to the skeleton's `0.0.1`. */
   readonly version?: VersionInfo;
+  /**
+   * Origins allowed to frame the `/embed/:token` surface (CSP
+   * `frame-ancestors`). Passed straight through to {@link AppDeps}; omit it and
+   * the embed is frameable by its own origin only. A deploy that hosts the
+   * dashboard on another origin lists it here.
+   */
+  readonly embedFrameAncestors?: readonly string[];
 }
 
 /**
@@ -126,6 +136,12 @@ export function buildDeps(adapters: BindingAdapters): AppDeps {
     // real seams it holds. Nothing here fabricates an AI-layer binding.
     m4: adapters.m4,
     version: adapters.version,
+    // The deploy-configurable framing seam: passed straight through so a
+    // composition root (the one holding `env`) can widen `/embed`'s
+    // `frame-ancestors` without this module guessing at an origin.
+    ...(adapters.embedFrameAncestors !== undefined
+      ? { embedFrameAncestors: adapters.embedFrameAncestors }
+      : {}),
   };
 }
 

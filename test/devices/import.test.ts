@@ -577,6 +577,21 @@ describe("whole-file refusals", () => {
     expect(await repo.listByProject("proj_a")).toEqual([]);
   });
 
+  it("refuses a body over maxBytes with 413 BEFORE lexing, writing nothing", async () => {
+    const { repo, devices } = setup();
+    const importer = new DeviceImportService(devices, { limits: { maxBytes: 12 } });
+    // A WELL-FORMED CSV that would import fine if it were lexed — proving the
+    // size gate fires ahead of the parser, not after it.
+    const data = "name\nAlpha\nBeta\n";
+
+    const err = await expectImportError(
+      () => importer.importDevices({ projectId: "proj_a", data, format: "csv" }),
+      "payload_too_large",
+    );
+    expect(err.status).toBe(413);
+    expect(await repo.listByProject("proj_a")).toEqual([]);
+  });
+
   it("exposes its effective limits, defaulting from the documented constant", () => {
     const { devices } = setup();
     expect(new DeviceImportService(devices).limits).toEqual(DEFAULT_IMPORT_LIMITS);
