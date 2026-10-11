@@ -9,8 +9,16 @@
  *
  * What this route adds on top of validation
  * -----------------------------------------
- *   1. **Auth** — a presented token is verified through an injected seam
+ *   1. **Auth** — the credential is parsed by the SAME helper every other
+ *      route uses, `readBearerToken` from `resolve-project.ts` (strict
+ *      `Bearer <token>`; a non-Bearer or bare header is not a credential at
+ *      all -> `401`), then verified through an injected seam
  *      ({@link VerifyToken}). Missing or unusable -> `401`.
+ *   1b. **Authorization** — ingest is a WRITE surface, so the resolved
+ *      principal is gated through the shared `requireScope(c, "write")`: a
+ *      credential that authenticates but lacks `write` (e.g. a `read`-scoped
+ *      device token) -> `403`. One credential parser and one scope gate are
+ *      shared with the admin routes.
  *   2. **Server-stamped time** — every accepted record is stamped with the
  *      *server's* clock (the injected `now` seam). Any device-supplied `ts`,
  *      `time` or `timestamp` field is IGNORED for ordering, so a device with a
@@ -43,6 +51,11 @@
 import type { Context } from "hono";
 import { Hono } from "hono";
 import {
+  requireScope,
+  readBearerToken,
+  type Principal,
+} from "../../platform/middleware/resolve-project";
+import {
   DEFAULT_LIMITS,
   checkSize,
   validateTelemetry,
@@ -62,14 +75,18 @@ import {
 export type Clock = () => number;
 
 /**
- * Verifies a presented plaintext token and resolves it to a project.
+ * Verifies a presented plaintext token and resolves it to the credential's
+ * {@link Principal}.
  *
- * Production wraps `verifyProjectToken` over the D1-backed `TokenRepo`; tests
- * pass a stub. Returning `null` (or throwing) means "not usable" and the route
- * answers `401` — the two are deliberately indistinguishable to the client, so
- * a caller cannot probe *why* a token failed.
+ * Production wraps `verifyProjectToken` over the D1-backed `TokenRepo` — which
+ * really does return a {@link DevicePrincipal}, carrying its `projectId` **and
+ * its `scopes`** — so the route can gate the write with the shared
+ * `requireScope`. Tests pass a stub. Returning `null` (or throwing) means "not
+ * usable" and the route answers `401` — the two are deliberately
+ * indistinguishable to the client, so a caller cannot probe *why* a token
+ * failed.
  */
-export type VerifyToken = (token: string) => Promise<{ projectId: string } | null>;
+export type VerifyToken = (token: string) => Promise<Principal | null>;
 
 /**
  * Persistence seam for accepted telemetry.
@@ -105,7 +122,12 @@ export interface DeviceRegistry {
 
 /** Everything the route needs, injectable end-to-end for tests. */
 export interface TelemetryDeps {
-  /** Verify the presented bearer token -> project, or `null` to refuse. */
+  /**
+   * Verify the presented bearer token -> {@link Principal}, or `null` to
+   * refuse. The resolved principal's kind must be `"device"` for a valid
+   * ingest; its `scopes` are what the shared `requireScope(c, "write")` gate
+   * consults.
+   */
   readonly verifyToken: VerifyToken;
   /** Where accepted metrics land (real DO in A09). */
   readonly sink: TelemetrySink;
@@ -164,22 +186,8 @@ export function normaliseDevice(raw: string | undefined, fallback: string): stri
 }
 
 /**
- * Extract the plaintext token from the `Authorization` header.
- *
- * Accepts the `Bearer <token>` scheme case-insensitively. A bare token (no
- * scheme) is also accepted, which keeps simple `curl -H` probes workable. A
- * missing header, or a `Bearer` with no token behind it, yields `""`, which no
- * verifier accepts.
+ * JSON `401` body, shared by both the missing-token and rejected-token paths.
  */
-export function readBearerToken(header: string | undefined): string {
-  const raw = (header ?? "").trim();
-  if (raw === "") return "";
-  const scheme = /^Bearer\s*(.*)$/i.exec(raw);
-  if (scheme !== null) return scheme[1].trim();
-  return raw;
-}
-
-/** JSON `401` body, shared by both the missing-token and rejected-token paths. */
 function unauthorized(c: Context): Response {
   const body: UnauthorizedBody = { error: "unauthorized", message: "a valid project token is required" };
   return c.json(body, 401);
@@ -282,7 +290,8 @@ export type TelemetryHandler = (c: Context) => Promise<Response>;
  * the mounted router so tests (and later wiring) can drop it onto any path.
  *
  * Failure mapping, in the order the checks run:
- *   * no/invalid token            -> `401`
+ *   * no/invalid token            -> `401` (missing/malformed/unknown)
+ *   * authentic but no `write`    -> `403` (shared `requireScope` gate)
  *   * shared validation failure   -> that result's own `400` / `413`
  *   * otherwise                   -> persist, then `204`
  */
@@ -294,17 +303,28 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
   return async function telemetryIngestHandler(c: Context): Promise<Response> {
     // 1. AUTH — before touching the body, so unauthenticated payloads are never
     //    parsed or measured (no timing/size oracle for an anonymous caller).
-    const token = readBearerToken(c.req.header("authorization"));
-    if (token === "") return unauthorized(c);
+    //    The credential is parsed by the SHARED strict Bearer parser: a
+    //    non-Bearer (`Basic …`) or bare value is not a credential at all -> 401.
+    const token = readBearerToken(c);
+    if (token === null) return unauthorized(c);
 
-    let project: { projectId: string } | null;
+    let principal: Principal | null;
     try {
-      project = await deps.verifyToken(token);
+      principal = await deps.verifyToken(token);
     } catch {
       // A throwing verifier is a refusal, not a 500: fail closed.
-      project = null;
+      principal = null;
     }
-    if (project === null) return unauthorized(c);
+    if (principal === null) return unauthorized(c);
+
+    // 1b. AUTHORIZATION — ingest is a WRITE surface. Expose the resolved
+    //     principal on the context exactly the way `resolveProject` does and
+    //     gate it with the SHARED `requireScope`, so a credential that
+    //     authenticates but lacks `write` (e.g. a `read`-scoped device token) is
+    //     refused `403` by the one policy module the admin routes also use.
+    c.set("principal", principal);
+    const refused = requireScope(c, "write");
+    if (refused !== null) return refused;
 
     // 2. NORMALISE — FR-DEV-01/03 accept both `{ metrics: {...} }` and the
     //    `{ metric, value }` shorthand beside the canonical `{ metrics: [...] }`
@@ -342,7 +362,7 @@ export function createTelemetryIngestHandler(deps: TelemetryDeps): TelemetryHand
     //    influence ordering.
     const ts = now();
     const device = normaliseDevice(c.req.header(DEVICE_HEADER), defaultDevice);
-    const projectId = project.projectId;
+    const projectId = principal.projectId;
 
     // 5. AUTO-REGISTER — first sighting only, and never fatal. An already-known
     //    device (or a concurrent first sighting) is a no-op, not an error.

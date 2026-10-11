@@ -243,7 +243,7 @@ async function buildSlice(now: () => number): Promise<Slice> {
 
   // --- ingest deps: the real handler, a real ShardDO sink, fixed clock ------
   const verifyToken: VerifyToken = async (token) =>
-    token === TOKEN ? { projectId: PROJECT } : null;
+    token === TOKEN ? { kind: "device", projectId: PROJECT } : null;
 
   const deps: TelemetryDeps = {
     verifyToken,

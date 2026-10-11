@@ -7,12 +7,15 @@ import {
   createTelemetryIngest,
   createTelemetryIngestHandler,
   normaliseDevice,
-  readBearerToken,
   type RecordedSample,
   type TelemetryDeps,
   type TelemetryHandler,
   type VerifyToken,
 } from "../../worker/src/domains/telemetry/telemetry";
+import {
+  readBearerToken,
+  type DevicePrincipal,
+} from "../../worker/src/platform/middleware/resolve-project";
 import { DEFAULT_LIMITS, validateTelemetry } from "../../worker/src/shared/validation";
 
 /**
@@ -21,8 +24,12 @@ import { DEFAULT_LIMITS, validateTelemetry } from "../../worker/src/shared/valid
  * Every dependency is injected, so each contract is asserted against a value we
  * control outright:
  *
- *   1. **Auth** — no token or a rejected token is `401`; a valid token resolves
- *      the project the samples are attributed to.
+ *   1. **Auth** — a missing, non-Bearer (e.g. `Basic …`) or bare header is NOT
+ *      a credential (`401`); a rejected token is `401`; a valid `write`-scoped
+ *      token resolves the project the samples are attributed to.
+ *   1b. **Authz** — ingest is a write surface gated by the SHARED
+ *      `requireScope(c, "write")`, so a `read`-scoped device token that
+ *      authenticates is refused `403`.
  *   2. **Server clock** — the timestamp handed to the sink is the injected
  *      `now()`, never anything a device could put in the body.
  *   3. **Device key** — `x-insight-device` names the sender; absent/blank falls
@@ -35,6 +42,13 @@ import { DEFAULT_LIMITS, validateTelemetry } from "../../worker/src/shared/valid
 
 const PROJECT = "proj_alpha";
 const TOKEN = "pt_valid_token";
+
+/**
+ * A well-formed device principal for {@link PROJECT}. `scopes` is left absent
+ * ("not restricted") so the baseline token holds every capability — the same
+ * shape production's `verifyProjectToken` returns for an unrestricted token.
+ */
+const DEVICE: DevicePrincipal = { kind: "device", projectId: PROJECT, tokenId: "tok_valid" };
 
 /** The exact server instant every test records against. */
 const SERVER_NOW = 1_700_000_000_123;
@@ -61,7 +75,7 @@ function harness(
   const devices = new InMemoryDeviceRegistry();
 
   const verifyToken: VerifyToken =
-    overrides.verifyToken ?? (async (token) => (token === TOKEN ? { projectId: PROJECT } : null));
+    overrides.verifyToken ?? (async (token) => (token === TOKEN ? DEVICE : null));
 
   const deps: TelemetryDeps = {
     verifyToken,
@@ -285,11 +299,123 @@ describe("POST /v1/telemetry — authentication", () => {
     expect(h.sink.size).toBe(0);
   });
 
+  it("rejects a non-Bearer `Basic …` header with 401 and records nothing", async () => {
+    // A Basic credential is not a credential on this surface: the shared
+    // strict parser refuses to extract one, so this is `401`, not a pass.
+    const h = harness();
+    const res = await h.app.request("/v1/telemetry", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Basic xyz" },
+      body: JSON.stringify({ metrics: { temp: 1 } }),
+    });
+
+    expect(res.status).toBe(401);
+    expect((await errorOf(res)).error).toBe("unauthorized");
+    expect(h.sink.size).toBe(0);
+  });
+
+  it("rejects a bare token (no Bearer scheme) with 401 and records nothing", async () => {
+    // Previously a bare value was accepted; the strict shared parser now
+    // treats it as "not a credential at all" — one parser, fail closed.
+    const h = harness();
+    const res = await h.app.request("/v1/telemetry", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: TOKEN },
+      body: JSON.stringify({ metrics: { temp: 1 } }),
+    });
+
+    expect(res.status).toBe(401);
+    expect((await errorOf(res)).error).toBe("unauthorized");
+    expect(h.sink.size).toBe(0);
+  });
+
+  it("rejects a scheme-less `Bearer` with no token behind it with 401", async () => {
+    const h = harness();
+    const res = await h.app.request("/v1/telemetry", {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: "Bearer" },
+      body: JSON.stringify({ metrics: { temp: 1 } }),
+    });
+
+    expect(res.status).toBe(401);
+    expect(h.sink.size).toBe(0);
+  });
+
   it("attributes samples to the project returned by the verifier", async () => {
-    const h = harness({ verifyToken: async () => ({ projectId: "proj_other" }) });
+    const h = harness({
+      verifyToken: async () => ({ kind: "device", projectId: "proj_other" }),
+    });
     await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-8" });
 
     expect(h.sink.last()!.projectId).toBe("proj_other");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Authorization — ingest is a WRITE surface gated by the shared requireScope
+// ---------------------------------------------------------------------------
+describe("POST /v1/telemetry — write authorization (shared scope gate)", () => {
+  /** A harness whose only usable token carries `read` scope (write forbidden). */
+  function readScoped(): Harness {
+    return harness({
+      verifyToken: async (token) =>
+        token === TOKEN ? { kind: "device", projectId: PROJECT, scopes: "read" } : null,
+    });
+  }
+
+  it("refuses a valid read-scoped token with 403 (previously it could write)", async () => {
+    const h = readScoped();
+    const res = await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-ro" });
+
+    expect(res.status).toBe(403);
+    // The body is the shared module's `insufficient_scope` shape, not the
+    // route's `unauthorized` — proving the policy module, not a local check.
+    expect((await errorOf(res)).error).toBe("insufficient_scope");
+    // A refusal never persists, registers, or even parses the body.
+    expect(h.sink.size).toBe(0);
+    expect(h.devices.isRegistered(PROJECT, "dev-ro")).toBe(false);
+  });
+
+  it("accepts a write-scoped token with 204 and records the sample", async () => {
+    const h = harness({
+      verifyToken: async (token) =>
+        token === TOKEN ? { kind: "device", projectId: PROJECT, scopes: "read write" } : null,
+    });
+    const res = await postJson(h.app, { metrics: { temp: 25.4 } }, { "x-insight-device": "dev-rw" });
+
+    expect(res.status).toBe(204);
+    expect(tuple(h.sink.last()!)).toEqual([PROJECT, "dev-rw", "temp", 25.4, SERVER_NOW]);
+  });
+
+  it("accepts a write-only token (write without read) with 204", async () => {
+    const h = harness({
+      verifyToken: async (token) =>
+        token === TOKEN ? { kind: "device", projectId: PROJECT, scopes: "write" } : null,
+    });
+    const res = await postJson(h.app, { metrics: { cpu: 1 } }, { "x-insight-device": "dev-wo" });
+
+    expect(res.status).toBe(204);
+    expect(h.sink.last()!.device).toBe("dev-wo");
+  });
+
+  it("accepts an unrestricted device token (no scopes) with 204", async () => {
+    // The default harness token has no `scopes`, i.e. "not restricted".
+    const h = harness();
+    const res = await postJson(h.app, { metrics: { temp: 1 } }, { "x-insight-device": "dev-any" });
+
+    expect(res.status).toBe(204);
+    expect(h.sink.size).toBe(1);
+  });
+
+  it("a read-scoped token is refused BEFORE the body is validated (403, not 400)", async () => {
+    // An invalid body must not turn the 403 into a 400: authz precedes parsing,
+    // exactly as auth does.
+    const h = readScoped();
+    const res = await postRaw(h.app, "{not json", { "x-insight-device": "dev-ro2" });
+
+    expect(res.status).toBe(403);
+    expect((await errorOf(res)).error).toBe("insufficient_scope");
+    expect(h.sink.size).toBe(0);
   });
 });
 
@@ -446,7 +572,7 @@ describe("createTelemetryIngestHandler", () => {
     const sink = new InMemoryTelemetrySink();
     const devices = new InMemoryDeviceRegistry();
     const handler = createTelemetryIngestHandler({
-      verifyToken: async () => ({ projectId: PROJECT }),
+      verifyToken: async () => ({ kind: "device", projectId: PROJECT }),
       sink,
       devices,
       now: () => SERVER_NOW,
@@ -471,11 +597,30 @@ describe("telemetry helpers", () => {
     expect(normaliseDevice("x".repeat(500), "fallback").length).toBe(128);
   });
 
-  it("readBearerToken accepts the Bearer scheme case-insensitively and bare tokens", () => {
-    expect(readBearerToken("Bearer pt_abc")).toBe("pt_abc");
-    expect(readBearerToken("bearer pt_abc")).toBe("pt_abc");
-    expect(readBearerToken("pt_abc")).toBe("pt_abc");
-    expect(readBearerToken("Bearer   ")).toBe("");
-    expect(readBearerToken(undefined)).toBe("");
+  it("the credential is parsed by the SHARED strict Bearer parser (not a local one)", async () => {
+    // Probe `readBearerToken` through a real Hono context: it returns `null`
+    // for anything that is not a well-formed `Bearer <token>`, and the exact
+    // token for a valid one. This pins the parser telemetry.ts consumes.
+    const probe = async (authorization?: string): Promise<string | null> => {
+      const app = new Hono();
+      let seen: string | null = "<unset>";
+      app.get("/probe", (c) => {
+        seen = readBearerToken(c);
+        return c.text("ok");
+      });
+      await app.request("/probe", {
+        headers: authorization === undefined ? {} : { authorization },
+      });
+      return seen;
+    };
+
+    expect(await probe("Bearer pt_abc")).toBe("pt_abc");
+    expect(await probe("bearer pt_abc")).toBe("pt_abc");
+    // Strict: a bare token, a Basic scheme and a tokenless Bearer are all
+    // "no credential" -> null (which the route maps to 401).
+    expect(await probe("pt_abc")).toBeNull();
+    expect(await probe("Basic xyz")).toBeNull();
+    expect(await probe("Bearer")).toBeNull();
+    expect(await probe(undefined)).toBeNull();
   });
 });
