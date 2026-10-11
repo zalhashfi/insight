@@ -15,15 +15,17 @@
  *     `application/octet-stream`; a 429 carries `retry-after`; a missing image
  *     is `404`; the offer request header is `x-insight-firmware`.
  *   * ABSENCE — neither OTA route is wired server-side yet (tickets A18b /
- *     A18c), so a fresh app 404s the path. This asserts the routes do NOT
- *     exist; it never fabricates one to satisfy a shape.
+ *     A18c), so the REAL composed app (`createApp(fakeDeps)`) 404s the path
+ *     while its sibling routes still answer. This asserts the routes do NOT
+ *     exist; it never fabricates one to satisfy a shape, and it never uses a
+ *     bare `new Hono()` (which 404s everything and would prove nothing).
  *
  * The cross-repo half lives in `mirror.test.ts`, which asserts these same
  * values against the SDK's C++ mirror.
  */
 
 import { describe, expect, it } from "vitest";
-import { Hono } from "hono";
+import { createApp, type AppDeps } from "../../worker/src/app";
 import {
   CONTRACT_HEADERS,
   GET_OTA,
@@ -62,6 +64,43 @@ const UPDATE_BODY: Record<string, unknown> = {
     [URL]: "/v1/ota/image/1.2.0",
   },
 };
+
+// ---------------------------------------------------------------------------
+// The REAL composed app — the absence probes run against production wiring.
+// ---------------------------------------------------------------------------
+
+/**
+ * The composed production surface (`createApp`) with honest, in-memory seams.
+ *
+ * The absence probes below MUST drive this app, not a bare `new Hono()`: a bare
+ * Hono has no routes at all, so it 404s every path and would "prove" the OTA
+ * routes are absent even if `createApp` had wired them. `createApp` mounts the
+ * real middleware and routers, so a genuine `/v1/ota` (or `/v1/ota/image`)
+ * handler appearing in `worker/src/app.ts` makes these probes observe a
+ * non-404 and FAIL — the tripwire is load-bearing.
+ *
+ * Every seam is a minimal in-memory stand-in; nothing here is the code under
+ * test, and no OTA route is ever fabricated.
+ */
+function fakeDeps(): AppDeps {
+  return {
+    deviceTokens: async (token) =>
+      token.startsWith("pt_") ? { kind: "device", projectId: "proj_contract", scopes: "read write" } : null,
+    sessions: async () => null,
+    ingest: {
+      verifyToken: async (token) =>
+        token.startsWith("pt_") ? { kind: "device", projectId: "proj_contract", scopes: "read write" } : null,
+      sink: { record: async () => undefined },
+      devices: { register: () => undefined, has: () => false },
+      now: () => 1_700_000_000_000,
+    },
+    query: {
+      credentials: async () => null,
+      projects: { state: async () => [] },
+      shards: { ring: async () => [] },
+    },
+  };
+}
 
 // ---------------------------------------------------------------------------
 // Lock self-consistency
@@ -192,27 +231,48 @@ describe("GET /v1/ota/image shape", () => {
 // Not-yet-implemented routes — asserted ABSENT, never invented
 // ---------------------------------------------------------------------------
 
-describe("OTA routes are not wired server-side yet (M3 / A18b, A18c)", () => {
-  it("GET /v1/ota has no live route yet", async () => {
+describe("OTA routes are absent from the REAL composed app (M3 / A18b, A18c)", () => {
+  // The composed app mounts `securityHeaders` on `*`, the ingest router and the
+  // read router — everything production wires. A bare `new Hono()` would 404
+  // these paths no matter what `createApp` mounts, so it could never catch the
+  // OTA routes being wired: that is the vacuous 404 this suite must not use.
+  const app = createApp(fakeDeps());
+
+  it("GET /v1/ota is NOT wired into createApp", async () => {
     expect(OTA_OFFER.implemented).toBe(false);
-    // A fresh app with no routes: the framework edge is what the contract sees.
-    const app = new Hono();
     const res = await app.request(OTA_OFFER.path, {
       method: OTA_OFFER.method,
-      headers: { [CONTRACT_HEADERS.authorization]: "Bearer pt_test", [CONTRACT_HEADERS.firmware]: "1.0.0" },
+      headers: {
+        [CONTRACT_HEADERS.authorization]: "Bearer pt_test",
+        [OTA_OFFER.requestHeader]: "1.0.0",
+      },
     });
-    // Absent, exactly as the parent lock's contract.test.ts records it.
+    // Absent at the framework edge of the composed app — not at a route-less stub.
     expect(res.status).toBe(STATUS.notFound);
   });
 
-  it("GET /v1/ota/image has no live route yet", async () => {
+  it("GET /v1/ota/image is NOT wired into createApp", async () => {
     expect(OTA_IMAGE.implemented).toBe(false);
-    const app = new Hono();
     const res = await app.request(OTA_IMAGE.path, {
       method: OTA_IMAGE.method,
-      headers: { [CONTRACT_HEADERS.authorization]: "Bearer pt_test", [CONTRACT_HEADERS.firmware]: "1.0.0" },
+      headers: {
+        [CONTRACT_HEADERS.authorization]: "Bearer pt_test",
+        [OTA_IMAGE.requestHeader]: "1.0.0",
+      },
     });
     expect(res.status).toBe(STATUS.notFound);
+  });
+
+  it("the /v1/ota family is genuinely unrouted (a control path resolves first)", async () => {
+    // The 404s above are the framework edge, not a blanket "nothing answers":
+    // a sibling `/v1` route the composed app DOES mount proves the app routes
+    // requests at all, so the OTA 404s are about OTA being unwired, not about a
+    // dead app. `/v1/version` is constant and needs no credential.
+    const known = await app.request("/v1/version", { method: "GET" });
+    expect(known.status).toBe(STATUS.ok);
+    // And a path one segment under the offer path is likewise absent.
+    const deeper = await app.request(`${OTA_OFFER.path}/anything`, { method: "GET" });
+    expect(deeper.status).toBe(STATUS.notFound);
   });
 
   it("the frozen 429 and 404 are what the routes WILL return once wired", () => {
