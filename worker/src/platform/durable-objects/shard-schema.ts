@@ -76,7 +76,9 @@ CREATE INDEX IF NOT EXISTS idx_inflight_device
 -- flush_meta — per-device flush bookkeeping and per-stream ordering state.
 --   Rows are per (device, metric): the latest accepted (value, ts, seq) for the
 --   stream, the monotonic seq high-water mark used to order samples, and the
---   per-device dropped counter bumped when the ring evicts.
+--   per-device dropped counter bumped when the ring evicts. 'flushed_seq' is
+--   the A10 drain high-water: every seq <= it has reached the analytics store,
+--   so the drain never re-emits those rows (INV-T4).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS flush_meta (
   device      TEXT    NOT NULL,

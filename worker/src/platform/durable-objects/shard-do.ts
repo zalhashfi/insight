@@ -118,6 +118,33 @@ export interface ShardStorage {
   ringCount(device: string): Promise<number>;
   /** Per-device dropped total across all streams. */
   dropped(device: string): Promise<number>;
+
+  // --- Drain surface (A10 flush) --------------------------------------
+  // The second half of the write-ahead protocol: a flush claims rows to put
+  // them in flight, then, only once R2 has durably accepted them, drains them
+  // so they are never emitted again (INV-T4). Both are idempotent, so a
+  // re-run after a crash between the put and the drain neither loses nor
+  // duplicates a point.
+
+  /**
+   * Remove a delivered inflight row by `(device, seq)`.
+   *
+   * Idempotent: deleting an already-drained row is a no-op, so a drain that
+   * is retried after a partial crash is safe to repeat wholesale.
+   */
+  deleteInflight(device: string, seq: number): Promise<void>;
+
+  /**
+   * Advance a device's flush high-water mark to `upToSeq`.
+   *
+   * Monotonic: a value below the stored mark is ignored, so a retry of an
+   * older drain can never roll the mark backwards. This is the durable
+   * record of "every seq `<= upToSeq` has reached the analytics store".
+   */
+  commitFlushed(device: string, upToSeq: number): Promise<void>;
+
+  /** The device's durable flush high-water mark (0 when never flushed). */
+  flushedTo(device: string): Promise<number>;
 }
 
 // ---------------------------------------------------------------------------
@@ -321,6 +348,26 @@ export class ShardDO {
   }
 
   /**
+   * Drain delivered rows from the journal — the second half of the flush.
+   *
+   * Called by {@link flushShard} *after* R2 has durably accepted a window, so
+   * that a row is deleted only once it can no longer be lost. Both steps are
+   * idempotent: `deleteInflight` tolerates a row that is already gone, and
+   * `commitFlushed` refuses to move the high-water mark backwards. A drain
+   * interrupted half-way and re-run therefore converges to the same state.
+   *
+   * Returns the high-water mark it committed.
+   */
+  async drain(device: string, upToSeq: number): Promise<number> {
+    const rows = await this.storage.inflight(device);
+    for (const row of rows) {
+      if (row.seq <= upToSeq) await this.storage.deleteInflight(device, row.seq);
+    }
+    await this.storage.commitFlushed(device, upToSeq);
+    return upToSeq;
+  }
+
+  /**
    * Samples evicted from the ring buffer because a stream was full.
    *
    * `getDropped()` is the whole-shard total (the sum over devices); passing a
@@ -357,6 +404,8 @@ export class InMemoryShardStorage implements ShardStorage {
   private readonly metas = new Map<string, StreamMeta>();
   private readonly rings = new Map<string, Sample[]>();
   private readonly journals = new Map<string, Sample[]>();
+  /** Per-device flush high-water mark, mirroring `flush_meta.flushed_seq`. */
+  private readonly flushed = new Map<string, number>();
 
   /** Rows of one stream, oldest first (a copy, so callers cannot mutate it). */
   ring(device: string, metric: string): Promise<Sample[]> {
@@ -413,6 +462,29 @@ export class InMemoryShardStorage implements ShardStorage {
       if (meta.device === device) total += meta.dropped;
     }
     return Promise.resolve(total);
+  }
+
+  /** Remove a delivered journal row by `(device, seq)`; a no-op if absent. */
+  deleteInflight(device: string, seq: number): Promise<void> {
+    const rows = this.journals.get(device);
+    if (rows) {
+      const kept = rows.filter((row) => row.seq !== seq);
+      if (kept.length === 0) this.journals.delete(device);
+      else this.journals.set(device, kept);
+    }
+    return Promise.resolve();
+  }
+
+  /** Monotonic flush high-water mark for a device. */
+  commitFlushed(device: string, upToSeq: number): Promise<void> {
+    const current = this.flushed.get(device) ?? 0;
+    if (upToSeq > current) this.flushed.set(device, upToSeq);
+    return Promise.resolve();
+  }
+
+  /** The device's durable flush high-water mark (0 when never flushed). */
+  flushedTo(device: string): Promise<number> {
+    return Promise.resolve(this.flushed.get(device) ?? 0);
   }
 
   /** Every stream's ordering state, for priming a projection. */
