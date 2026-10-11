@@ -47,10 +47,24 @@
  *
  * Extension seam
  * --------------
- * {@link RateLimiter.asResponse} renders a denial as an HTTP `Response` and
  * {@link rateLimitedBody} produces the exact `{ error, message }` body the other
- * device routes use, so a route can compose the limiter without reaching into
- * its internals. Nothing else in this module touches HTTP.
+ * device routes use, and the limiter's decision carries a ready-to-send
+ * `headers` object (the `retry-after`), so a route can compose the limiter
+ * without reaching into its internals. Nothing else in this module touches HTTP.
+ *
+ * Public surface (kept deliberately small)
+ * ----------------------------------------
+ * Only what a caller actually composes is exported: {@link RateLimiter},
+ * {@link RateLimiterOptions}, {@link RateLimitPolicy}, the {@link Clock} seam,
+ * the {@link RateLimitDecision} union (with its two arms), the frozen
+ * {@link RATE_LIMITED_CODE} / {@link RATE_LIMITED_STATUS} /
+ * {@link RETRY_AFTER_HEADER} contract constants, {@link rateLimitedBody} and the
+ * shared {@link defaultRateLimiter}. The body's `RateLimitedBody` type alias,
+ * the default `429` message and the per-key sample-cap default are
+ * implementation details: they were previously `export`ed but had no consumer in
+ * `worker/` or `test/`, so they are now module-private (the constants are still
+ * named and documented in place). Re-export them if and when a real caller
+ * needs them — an unused export is a promise this module does not keep.
  */
 
 // ---------------------------------------------------------------------------
@@ -83,9 +97,6 @@ export const RATE_LIMITED_STATUS = 429 as const;
 
 /** Response header naming the seconds until the window frees (RFC 9110). */
 export const RETRY_AFTER_HEADER = "retry-after" as const;
-
-/** Default human message attached to a `429` body. */
-export const RATE_LIMITED_MESSAGE = "rate limit exceeded; retry later" as const;
 
 // ---------------------------------------------------------------------------
 // Decision types
@@ -128,11 +139,20 @@ export interface RateLimitExceeded {
 /** Discriminated outcome of {@link RateLimiter.checkAndConsume}. */
 export type RateLimitDecision = RateLimitAllowed | RateLimitExceeded;
 
-/** The `{ error, message }` body sent alongside a `429`. */
-export interface RateLimitedBody {
+/**
+ * The `{ error, message }` body sent alongside a `429`.
+ *
+ * The frozen part is `error` (`"rate_limited"`); `message` is a human-readable
+ * hint. Kept as the return type of {@link rateLimitedBody} so the shape is
+ * named without being an exported alias of its own.
+ */
+interface RateLimitedBody {
   readonly error: typeof RATE_LIMITED_CODE;
   readonly message: string;
 }
+
+/** Default human message attached to a `429` body. */
+const RATE_LIMITED_MESSAGE = "rate limit exceeded; retry later" as const;
 
 /**
  * Build the frozen `429` body. Kept separate from the decision so a route can
@@ -173,8 +193,12 @@ export interface RateLimiterOptions {
   readonly maxSamplesPerKey?: number;
 }
 
-/** Default per-key sample cap: generous enough for any realistic `limit`. */
-export const DEFAULT_MAX_SAMPLES_PER_KEY = 10_000;
+/**
+ * Default per-key sample cap: generous enough for any realistic `limit`. Kept
+ * module-private — it is an implementation default, not a knob callers express,
+ * so it is not part of the limiter's public surface.
+ */
+const DEFAULT_MAX_SAMPLES_PER_KEY = 10_000;
 
 // ---------------------------------------------------------------------------
 // The limiter
