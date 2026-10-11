@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import { Hono } from "hono";
+// `node:fs` is available at runtime under both `bun test` and vitest; a static
+// import is used so the dependency graph is visible. Node's own types are not
+// in this repo's tsconfig `types`, so the two calls the audit needs are pinned
+// by the colocated `./node-fs` shim rather than an unchecked cast here.
+import { readDirectorySync, readTextFileSync } from "./node-fs";
 
 // --- the REAL seams, wired through their existing exported entry points ------
 import {
@@ -43,6 +48,70 @@ import {
   TELEMETRY_REQUEST_SHAPES,
 } from "../contracts/contract-lock";
 
+// --- the REAL iot-sim sensor code (the device side of the wire) --------------
+// Loaded from the sibling `insight-internal` repo — the same source the iot-sim
+// binary runs — so E02 is driven by the actual generator rather than a copy of
+// it. The module is plain ESM JavaScript with no package manifest of its own,
+// so it is reached by relative path; a runtime probe below pins the exact
+// module identity so a move/rename fails loudly instead of silently skipping.
+// @ts-expect-error iot-sim is plain JavaScript in a sibling repo with no
+// declarations, and this task may not add a `.d.ts` for it. The module is real
+// at runtime; {@link assertIotSimSurface} below proves its shape before use.
+import * as iotSimModule from "../../../insight-internal/src/iot-sim/sensors.js";
+
+/**
+ * Minimal, explicitly-typed surface of the iot-sim sensors module this test
+ * uses. Declared here (the module ships no `.d.ts`) so the seam is *asserted*,
+ * not assumed: {@link assertIotSimSurface} fails the run if the real module
+ * stops exposing these, and every call site is then checked against this shape.
+ */
+interface IotSimSensors {
+  /** Standalone temperature walk: `read(rng)` → next value. */
+  createTemperatureSensor(opts?: {
+    initial?: number;
+    mean?: number;
+    min?: number;
+    max?: number;
+    step?: number;
+    reversion?: number;
+    digits?: number;
+    key?: string;
+  }): {
+    read(rng: () => number): number;
+    sample(rng: () => number): Record<string, number>;
+    readonly value: number;
+  };
+  /** Deterministic 32-bit LCG; the temperature walk draws from it. */
+  createRng(seed?: number): (() => number) & { next: () => number; seed: number; count: number };
+}
+
+/**
+ * Fail fast (at import time) unless the imported module really is the iot-sim
+ * sensors seam. The probe calls the exported constructors, so a rename — or an
+ * import that resolved to a stub/`undefined` — throws here rather than letting
+ * every downstream assertion silently drift.
+ */
+function assertIotSimSurface(mod: unknown): IotSimSensors {
+  const candidate = mod as Partial<IotSimSensors>;
+  for (const name of ["createTemperatureSensor", "createRng"] as const) {
+    if (typeof candidate[name] !== "function") {
+      throw new Error(`iot-sim sensors module is missing exported ${name}()`);
+    }
+  }
+  const surface = candidate as IotSimSensors;
+  // Exercise the seam once: an LCG draw in [0,1) and a real temperature sample.
+  const probeRng = surface.createRng(24);
+  const draw = probeRng();
+  if (!(draw >= 0 && draw < 1)) throw new Error(`iot-sim createRng() produced ${draw}`);
+  const probeSample = surface.createTemperatureSensor().sample(probeRng);
+  if (typeof probeSample["temp"] !== "number") {
+    throw new Error("iot-sim createTemperatureSensor().sample() did not yield a temp number");
+  }
+  return surface;
+}
+
+const iotSim: IotSimSensors = assertIotSimSurface(iotSimModule);
+
 /**
  * E02 — end-to-end M1 vertical-slice evidence (device → cloud → dashboard →
  * analytics store) plus the NFR-PERF-03 / INV-T5 D1 audit.
@@ -56,7 +125,9 @@ import {
  * The slice under test, in order:
  *
  *   1. an iot-sim-shaped `POST /v1/telemetry` body `{"metrics":{"temp":25.4}}`
- *      is built and its request shape asserted against the frozen contract lock;
+ *      is built from the REAL iot-sim sensor reading (imported from the sibling
+ *      `insight-internal` repo) and its request shape asserted against the
+ *      frozen contract lock;
  *   2. that exact request is handed to the REAL ingest handler via a fake
  *      `fetchImpl` transport (no socket, no CF runtime);
  *   3. the ingest sink records the metric into a ShardDO (the hot write path),
@@ -68,7 +139,8 @@ import {
  *
  * Finally, the D1 catalog is parsed and asserted to contain NO telemetry
  * data-point table (NFR-PERF-03 / INV-T5): the metadata store must never hold
- * per-reading rows.
+ * per-reading rows. The audit scans EVERY `*.sql` under `migrations/` — not a
+ * single named file — so a new migration cannot dodge the invariant.
  */
 
 // ---------------------------------------------------------------------------
@@ -81,7 +153,7 @@ const DEVICE = "sim-01";
 const VARIABLE = "temp";
 const TEMP = 25.4;
 
-/** iot-sim's seed for the M1 demo reading `{"temp":25.4}` (see seededReading). */
+/** iot-sim's seed for the M1 demo reading `{"temp":25.4}` (see {@link simTemperatureReading}). */
 const SEED = 24;
 /** The 1-based reading index at which that seed reports temp = 25.4. */
 const READING_INDEX = 17;
@@ -305,26 +377,33 @@ const LCG_MULTIPLIER = 1664525;
 const LCG_INCREMENT = 1013904223;
 
 /**
- * The deterministic `sim-01` temperature reading at `seed`, computed with the
- * EXACT algorithm the iot-sim temperature sensor uses: a mean-reverting random
- * walk (`initial=mean=25`, `min=15`, `max=35`, `step=0.15`, `reversion=0.3`,
- * 2-decimal quantisation) over iot-sim's 32-bit LCG. Reimplemented here — not
- * imported — because the simulator lives in the sibling `insight-internal`
- * repo; this pins the wire body the insight slice consumes without a
- * cross-repo dependency.
+ * An INDEPENDENT re-implementation of the deterministic `sim-01` temperature
+ * walk — the exact algorithm the iot-sim temperature sensor uses: a
+ * mean-reverting random walk (`initial=mean=25`, `min=15`, `max=35`,
+ * `step=0.15`, `reversion=0.3`, 2-decimal quantisation) over iot-sim's 32-bit
+ * LCG.
  *
- * `index` is the 1-based reading to return, so the slice can consume the same
- * running-simulator sequence iot-sim would emit: at ({@link SEED},
- * {@link READING_INDEX}) this yields the M1 demo value `25.4`.
+ * E02 is driven by the REAL {@link iotSim} module; this second copy exists only
+ * as the subject of the drift guard below, which proves the two walk identically
+ * over a long run. Were the real sim to change its algorithm and this copy not
+ * to, that guard fails — so the loop stays closed rather than the copy silently
+ * rotting.
+ *
+ * Returns the first `count` readings (1-based: element `i` is reading `i + 1`),
+ * so the slice can consume the same running-simulator sequence iot-sim would
+ * emit: at ({@link SEED}, {@link READING_INDEX}) this yields `25.4`.
  */
-function seededReading(seed: number, index: number): { metrics: Record<string, number> } {
+function seededReadingSequence(seed: number, count: number): number[] {
   let state = seed >>> 0;
   const rng = (): number => {
     state = (Math.imul(state, LCG_MULTIPLIER) + LCG_INCREMENT) >>> 0;
     return state / 4294967296;
   };
 
-  // iot-sim's temperature sensor: a mean-reverting step from `initial = 25`.
+  // iot-sim's temperature sensor: a mean-reverting step from `initial = 25`
+  // (the sensor's `initial` default equals its `mean` default, so the walk
+  // starts on trend).
+  const initial = 25;
   const mean = 25;
   const min = 15;
   const max = 35;
@@ -332,8 +411,9 @@ function seededReading(seed: number, index: number): { metrics: Record<string, n
   const reversion = 0.3;
   const scale = 10 ** READING_DIGITS;
 
-  let current = mean;
-  for (let i = 0; i < index; i += 1) {
+  let current = initial;
+  const readings: number[] = [];
+  for (let i = 0; i < count; i += 1) {
     const magnitude = stepSize * (0.5 + rng());
     const direction = rng() < 0.5 ? -1 : 1;
     const drift = (mean - current) * reversion;
@@ -342,9 +422,35 @@ function seededReading(seed: number, index: number): { metrics: Record<string, n
     if (candidate < min) candidate = min + (min - candidate);
     const quantized = Math.round(candidate * scale) / scale;
     if (quantized > min && quantized < max) current = quantized;
+    readings.push(current);
   }
 
-  return { metrics: { [VARIABLE]: current } };
+  return readings;
+}
+
+/**
+ * The M1 demo reading produced by the REAL iot-sim code, read straight from
+ * `insight-internal`'s sensors module.
+ *
+ * The temperature walk is a pure function of the readings drawn so far, so the
+ * `index`-th reading is reproduced by giving a fresh LCG the same seed and
+ * asking the real {@link iotSim.createTemperatureSensor} for `index` reads.
+ * This is the device-side ground truth E02 publishes: `{"temp": 25.4}` at
+ * ({@link SEED}, {@link READING_INDEX}).
+ */
+function simTemperatureReading(seed: number, index: number): { metrics: Record<string, number> } {
+  return { metrics: { [VARIABLE]: simTemperatureSequence(seed, index)[index - 1] } };
+}
+
+/** The REAL iot-sim temperature walk's first `count` readings (1-based order). */
+function simTemperatureSequence(seed: number, count: number): number[] {
+  const rng = iotSim.createRng(seed);
+  const sensor = iotSim.createTemperatureSensor();
+  const readings: number[] = [];
+  for (let i = 0; i < count; i += 1) {
+    readings.push(sensor.read(rng));
+  }
+  return readings;
 }
 
 // ===========================================================================
@@ -355,10 +461,11 @@ describe("M1 vertical slice — device → cloud → dashboard → R2", () => {
     const slice = await buildSlice(() => 1_700_000_000_123);
 
     // --- (1) iot-sim builds the request: `{"metrics":{"temp":25.4}}` ---------
-    // The metrics map is the iot-sim sensor's deterministic output at the M1
-    // demo seed/index, so the whole slice is driven by the simulator's own
-    // reading rather than a hand-written literal.
-    const readings = seededReading(SEED, READING_INDEX);
+    // The metrics map is the REAL iot-sim sensor's deterministic output at the
+    // M1 demo seed/index — read from `insight-internal`'s `sensors.js`, not
+    // re-derived here — so the whole slice is driven by the simulator's own
+    // reading. A change to the simulator moves this value and breaks the slice.
+    const readings = simTemperatureReading(SEED, READING_INDEX);
     expect(readings).toEqual({ metrics: { [VARIABLE]: TEMP } });
     const request = slice.simRequest(readings.metrics);
 
@@ -444,8 +551,21 @@ describe("M1 vertical slice — device → cloud → dashboard → R2", () => {
   });
 
   it("emits the M1 demo reading 25.4 from the iot-sim seed (deterministic)", () => {
-    // Pins the exact body the slice drives, so the scenario is reproducible.
-    expect(seededReading(SEED, READING_INDEX)).toEqual({ metrics: { [VARIABLE]: TEMP } });
+    // Pins the exact body the slice drives, from the REAL module, so the
+    // scenario is reproducible and any simulator change is caught here.
+    expect(simTemperatureReading(SEED, READING_INDEX)).toEqual({ metrics: { [VARIABLE]: TEMP } });
+
+    // Drift guard: the independent inline mirror must walk the SAME path as the
+    // imported simulator. A long continuous run (not a few isolated indexes) is
+    // what makes this load-bearing — a per-step drift too small to change one
+    // reading accumulates and diverges deeper in the run (~1000 steps for a
+    // 1e-6 parameter nudge), so the whole sequence is walked and compared.
+    const RUN = 1200;
+    for (let seed = 1; seed <= 40; seed += 1) {
+      expect(seededReadingSequence(seed, RUN), `iot-sim drift at seed ${seed}`).toEqual(
+        simTemperatureSequence(seed, RUN),
+      );
+    }
   });
 
   it("ingest is device-safe: a rejected token is 401, nothing persisted", async () => {
@@ -513,30 +633,52 @@ describe("M1 slice — the point lands in the R2 NDJSON object", () => {
 // 3. D1 audit — NFR-PERF-03 / INV-T5: NO telemetry data-point table.
 // ===========================================================================
 
-const SQL_PATH = new URL(
-  "../../worker/src/platform/db/migrations/0001_init.sql",
+const MIGRATIONS_DIR = new URL(
+  "../../worker/src/platform/db/migrations/",
   import.meta.url,
 );
 
+/** One migration on disk: its file name, path and raw SQL text. */
+interface MigrationFile {
+  /** Path relative to {@link MIGRATIONS_DIR}, POSIX-separated and sorted. */
+  readonly name: string;
+  readonly path: URL;
+  readonly sql: string;
+}
+
 /**
- * Read a file in-process without Node type packages (the repo's `tsconfig`
- * pins `types` to Workers + vitest). Bun provides `Bun.file` at runtime; it is
- * reached through `globalThis` with a runtime guard so this file neither
- * redeclares the ambient `Bun` global (owned by `test/db/schema.test.ts`) nor
- * trusts an unchecked shape.
+ * Recursively collect every `*.sql` file under the migrations directory, so the
+ * audit scans the WHOLE migration history — not just `0001_init.sql`. A future
+ * `0002_*.sql` (or a nested subdirectory) is picked up automatically; a new
+ * file cannot dodge the invariant by not being named in this test.
+ *
+ * Uses `node:fs` (available at runtime in both `bun test` and vitest) to walk
+ * the tree. Node types are not in this repo's tsconfig `types`, so the module
+ * is imported through a dynamic `import()` and narrowed to the tiny surface
+ * used here — no ambient Node globals are declared.
+ *
+ * Sorted by relative name for stable output. An empty directory throws, since a
+ * silently-empty scan would make every downstream assertion vacuously pass.
  */
-async function readTextFile(path: URL): Promise<string> {
-  const bun: unknown = (globalThis as Record<string, unknown>)["Bun"];
-  if (
-    bun !== null &&
-    typeof bun === "object" &&
-    "file" in bun &&
-    typeof bun.file === "function"
-  ) {
-    const file = bun.file(path) as { text?: unknown };
-    if (typeof file.text === "function") return (file.text as () => Promise<string>)();
+async function readMigrationFiles(dir: URL): Promise<MigrationFile[]> {
+  const out: MigrationFile[] = [];
+  const walk = (current: URL, prefix: string): void => {
+    for (const entry of readDirectorySync(current, { withFileTypes: true })) {
+      const relative = prefix === "" ? entry.name : `${prefix}/${entry.name}`;
+      const path = new URL(entry.name + (entry.isDirectory() ? "/" : ""), current);
+      if (entry.isDirectory()) {
+        walk(path, relative);
+      } else if (entry.name.toLowerCase().endsWith(".sql")) {
+        out.push({ name: relative, path, sql: readTextFileSync(path, "utf8") });
+      }
+    }
+  };
+  walk(dir, "");
+  out.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+  if (out.length === 0) {
+    throw new Error(`no *.sql migrations found under ${dir.pathname}`);
   }
-  throw new Error("Bun.file is required to read the D1 migration in-process");
+  return out;
 }
 
 /** Parse the migration's catalog: table names + the full `CREATE TABLE` body. */
@@ -570,14 +712,17 @@ function readCatalog(sql: string): {
   return { statements, tables, bodyOf };
 }
 
-// Read + parse the catalog once, at module scope (top-level await is legal in
-// an ESM module body, unlike inside a `describe` callback).
-const D1_SQL = await readTextFile(SQL_PATH);
-const D1_CATALOG = readCatalog(D1_SQL);
+// Read + parse every migration once, at module scope (top-level await is legal
+// in an ESM module body, unlike inside a `describe` callback).
+const D1_MIGRATIONS: MigrationFile[] = await readMigrationFiles(MIGRATIONS_DIR);
+const D1_CATALOGS = D1_MIGRATIONS.map((migration) => ({
+  migration,
+  catalog: readCatalog(migration.sql),
+}));
 
 describe("NFR-PERF-03 / INV-T5 — D1 is metadata only, no telemetry-point store", () => {
-  const SQL = D1_SQL;
-  const catalog = D1_CATALOG;
+  const migrations = D1_MIGRATIONS;
+  const catalogs = D1_CATALOGS;
 
   /** Names that would betray a per-reading / telemetry-point store. */
   const POINT_STORE_NAMES = [
@@ -606,11 +751,23 @@ describe("NFR-PERF-03 / INV-T5 — D1 is metadata only, no telemetry-point store
     /^\s*metric_value\s/im,
   ];
 
+  it("scans the WHOLE migration set, not a single hard-coded file", () => {
+    // The audit is only meaningful if it actually found migrations to scan; a
+    // future file added to the directory is covered without editing this test.
+    expect(migrations.length).toBeGreaterThan(0);
+    for (const migration of migrations) {
+      expect(migration.name.toLowerCase().endsWith(".sql")).toBe(true);
+      expect(migration.sql.length).toBeGreaterThan(0);
+    }
+  });
+
   it("parses a non-empty D1 catalog with the expected metadata tables", () => {
-    expect(catalog.tables.length).toBeGreaterThan(0);
-    // Every catalogued table is one of the known metadata tables — the shape
-    // of the audit: we KNOW the catalog, and none of it is telemetry points.
-    expect(catalog.tables).toEqual(
+    const tables = catalogs.flatMap(({ catalog }) => catalog.tables);
+    expect(tables.length).toBeGreaterThan(0);
+    // Every catalogued table across all migrations is one of the known metadata
+    // tables — the shape of the audit: we KNOW the catalog, and none of it is
+    // telemetry points.
+    expect(tables).toEqual(
       expect.arrayContaining([
         "schema_version",
         "users",
@@ -625,34 +782,51 @@ describe("NFR-PERF-03 / INV-T5 — D1 is metadata only, no telemetry-point store
     );
   });
 
-  it("has NO table whose NAME is a telemetry data-point store", () => {
-    for (const table of catalog.tables) {
-      for (const pattern of POINT_STORE_NAMES) {
-        expect(pattern.test(table), `D1 table "${table}" matches ${pattern}`).toBe(false);
+  it("has NO table (in ANY migration) whose NAME is a telemetry data-point store", () => {
+    for (const { migration, catalog } of catalogs) {
+      for (const table of catalog.tables) {
+        for (const pattern of POINT_STORE_NAMES) {
+          expect(
+            pattern.test(table),
+            `${migration.name}: table "${table}" matches ${pattern}`,
+          ).toBe(false);
+        }
       }
     }
   });
 
-  it("has NO table whose COLUMNS form a per-reading point store", () => {
-    for (const table of catalog.tables) {
-      const body = catalog.bodyOf(table) ?? "";
-      for (const pattern of POINT_STORE_COLUMNS) {
+  it("has NO table (in ANY migration) whose COLUMNS form a per-reading point store", () => {
+    for (const { migration, catalog } of catalogs) {
+      for (const table of catalog.tables) {
+        const body = catalog.bodyOf(table) ?? "";
+        for (const pattern of POINT_STORE_COLUMNS) {
+          expect(
+            pattern.test(body),
+            `${migration.name}: table "${table}" has a telemetry point-store column (${pattern})`,
+          ).toBe(false);
+        }
+      }
+    }
+  });
+
+  it("never mentions a banned telemetry-point table anywhere in ANY migration", () => {
+    for (const migration of migrations) {
+      for (const banned of ["telemetry_points", "readings", "samples"]) {
         expect(
-          pattern.test(body),
-          `D1 table "${table}" has a telemetry point-store column (${pattern})`,
+          new RegExp(`CREATE\\s+TABLE[^;]*${banned}`, "i").test(migration.sql),
+          `${migration.name} mentions banned table "${banned}"`,
         ).toBe(false);
       }
     }
   });
 
-  it("never mentions a banned telemetry-point table anywhere in the file", () => {
-    for (const banned of ["telemetry_points", "readings", "samples"]) {
-      expect(new RegExp(`CREATE\\s+TABLE[^;]*${banned}`, "i").test(SQL)).toBe(false);
-    }
-  });
-
-  it("documents the invariant in the migration header", () => {
-    expect(SQL).toMatch(/D1\s+IS\s+METADATA\s+ONLY/i);
-    expect(SQL).toMatch(/INV-T5/);
+  it("documents the invariant in the init migration header", () => {
+    // `0001_init.sql` is the schema definition of record; pin the invariant text
+    // there so a wholesale rewrite cannot quietly drop the statement.
+    const init = migrations.find((migration) => /(^|\/)0001_init\.sql$/i.test(migration.name));
+    expect(init, "0001_init.sql must exist").toBeDefined();
+    expect(init?.sql).toMatch(/D1\s+IS\s+METADATA\s+ONLY/i);
+    expect(init?.sql).toMatch(/INV-T5/);
   });
 });
+
