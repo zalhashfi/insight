@@ -53,7 +53,7 @@
  * ## Precision over recall, deliberately
  *
  * A credential scanner that cries wolf gets switched off. This one therefore
- * matches two narrow classes and nothing else:
+ * matches four narrow classes and nothing else:
  *
  *   * **Known credential formats** — AWS `AKIA…`, Stripe `sk_live_…`, GitHub
  *     `ghp_…`/`github_pat_…`, Slack `xox…`, Google `AIza…`, PEM private-key
@@ -62,6 +62,17 @@
  *     this codebase's own `SECRET_VALUE_MARKERS` list, which literally contains
  *     `"sk_live_"` — is not a finding, while a real key pasted after the prefix
  *     is.
+ *   * **Connection-string credentials** — `scheme://user:password@host`, the
+ *     userinfo a Postgres/Timescale/Redis/… DSN (or a webhook/bot URL) carries.
+ *     The rule is gated on an allow-list of back-end schemes, so a
+ *     credential-free URL — `https://example.test`, a webhook endpoint — is a
+ *     *location*, not a credential, and never fires.
+ *   * **Credential assignments** — `password=…`, `secret=…`, `apikey=…` in a
+ *     source string, including the query-string spelling (`?password=…`). The
+ *     key must be an exact whole word and the value must read as credential
+ *     material (mixed case, or a digit beside a letter), so a bare marker
+ *     (`"password="`), a header directive (`max-age=31536000`) and a SQL enum
+ *     (`status='pending'`) all stay clean.
  *   * **High-entropy blobs** — a quoted literal that is one long run of
  *     base64/hex characters carrying at least {@link ENTROPY_MIN_BITS_PER_CHAR}
  *     bits per character. This catches a secret in a *format we have never seen*
@@ -276,6 +287,158 @@ interface KnownSecretFormat {
 }
 
 /**
+ * The URL schemes whose `scheme://user:password@host` form is a credential —
+ * a connection string/repository DSN — rather than a location.
+ *
+ * The list is a **guard**, not a convenience: the userinfo rule fires only for
+ * these schemes. `https://user:pass@host` is a URL with credentials, but the
+ * everyday web already teaches an explorer to read `https://…@…` as "follow
+ * this link" (an `https://` prefix that ends in `@attacker` is the canonical
+ * phishing shape), and this repo's fixtures are littered with `https://hooks…`
+ * URLs. Restricting the rule to back-end schemes keeps it on the DSNs it is
+ * meant for — Postgres, Timescale, Redis, MongoDB, MySQL, AMQP, and the
+ * key-bearing webhook/bot schemes — without teaching the scanner to cry wolf on
+ * every URL. Every host below is one a repository genuinely holds credentials
+ * for; none is a bare page to be opened.
+ */
+const CREDENTIAL_URL_SCHEMES: readonly string[] = Object.freeze([
+  // Relational / analytical stores.
+  "postgres",
+  "postgresql",
+  "cockroachdb",
+  "mysql",
+  "mariadb",
+  "mssql",
+  "sqlserver",
+  "oracle",
+  "clickhouse",
+  // Caches, document stores and brokers.
+  "mongodb",
+  "mongodb+srv",
+  "redis",
+  "rediss",
+  "valkey",
+  "keydb",
+  "amqp",
+  "amqps",
+  "kafka",
+  "nats",
+  "rabbitmq",
+  "memcached",
+  "cassandra",
+  // Key-bearing service endpoints — a webhook/bot URL *is* the credential.
+  "smtp",
+  "smtps",
+  "ldap",
+  "ldaps",
+  "ftp",
+  "ftps",
+  "sftp",
+  "slack",
+  "discord",
+  "telegram",
+  "pagerduty",
+  "twilio",
+]);
+
+/** One token of the `scheme://user:password@host` DSN shape — the password. */
+const DSN_CREDENTIAL = "[A-Za-z0-9._~%!$&'*+,;=()-]{3,}";
+/** One token of the same shape — the user, or the host the password precedes. */
+const DSN_PART = "[A-Za-z0-9._~%+@-]{3,}";
+/**
+ * A `scheme://user:password@host` **connection string** — a credential carried
+ * in a URL's userinfo, the shape a Postgres/Timescale/Redis/… URL holds.
+ *
+ * Fires only when all five pieces hold:
+ *
+ *   * the scheme is one of {@link CREDENTIAL_URL_SCHEMES} (so a bare
+ *     `https://host` — a *location*, not a credential — never fires, and neither
+ *     does a credential-free `https://example.test`);
+ *   * a `user:` token of ≥3 URL-safe characters precedes the `:`; and
+ *   * a `password@` token of ≥3 such characters follows it, immediately in
+ *     front of…
+ *   * …a ≥3-character host, which anchors the match and does the discriminating
+ *     a trailing lookahead could not.
+ *
+ * The password class deliberately **excludes `/?` and whitespace**, and the
+ * user class excludes `/`, so the `:` of a *path* (`postgres://host:5432/db`,
+ * `postgres://host/a:b`) has no `@host` directly after it and cannot match: the
+ * rule needs a non-empty host, not a port, a path or a colon-joined label. A
+ * credential-free URL has no `user:password@` at all, so it has nothing for the
+ * pattern to hold onto.
+ */
+const DSN_URL_PATTERN = new RegExp(
+  // Scheme names are interpolated as *literals* — `mongodb+srv` must keep its
+  // `+` as a URL scheme character, not become the regex quantifier `b+s`.
+  `\\b(?:${CREDENTIAL_URL_SCHEMES.map((scheme) => scheme.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|")}):\\/\\/${DSN_PART}:${DSN_CREDENTIAL}@${DSN_PART}`,
+);
+
+/**
+ * A `KEY=value` / `KEY: value` **credential assignment** — a credential encoded
+ * as a query string or a config line (`?password=…`, `PGPASSWORD=…`,
+ * `"client_secret": "…"`), including the full `key=value` pair in the match so
+ * the report is legible and the surrounding text is consumed.
+ *
+ * The key must be *exactly* the **whole word** `password`/`passwd`/`pwd`/
+ * `secret`/`apikey` (bounded by `[^A-Za-z0-9]`, so a `user_secret_pointer`
+ * identifier can never reach it). A `secret=` prefix alone is empty, so the
+ * value side is the real filter: {@link ASSIGNMENT_VALUE_KIND} must read the
+ * remainder of the literal as credential material rather than a low-entropy
+ * word (see {@link isCredentialAssignmentValue}).
+ *
+ * The quoted-value spelling — `..._secret: "…"` — is deliberately **not** this
+ * rule. A value quoted on *both* sides inside a literal is ambiguous with the
+ * literal's own quotes and cannot be read reliably, so JSON-style assignments
+ * are covered by the entropy rule instead, which needs no key at all.
+ */
+const ASSIGNMENT_PATTERN = /(?:^|[^A-Za-z0-9])(password|passwd|pwd|secret|apikey)\s*[:=]\s*(\S+)/i;
+
+/**
+ * A value shaped like credential material — one long, unbroken, **mixed** token.
+ *
+ * The `lowerAndUpper` guard is the difference between a credential and the two
+ * everyday non-secrets that look like one in a header string:
+ *
+ *   * `max-age=31536000` (Strict-Transport-Security) — `31536000` is long, has
+ *     no whitespace and carries digits, so the symbol/length checks alone pass;
+ *     it is caught only by the demand for *both* cases of letters. `max-age` is
+ *     itself a key, so the value is the whole problem.
+ *   * `status='pending'` / `status='claimed'` (SQL in a DDL literal) — the value
+ *     carries a quote, so it passes the symbol check; `pending` is again
+ *     all-lowercase, and is caught by the same rule.
+ *
+ * A real credential in a `key=value` pair is base64/hex/random or an
+ * `AbCdEf123`-mixed secret: it carries **both** letter cases, or a digit beside
+ * a letter. English words, numbers and SQL enum values carry neither.
+ */
+const ASSIGNMENT_VALUE_KIND = Object.freeze({
+  /** At least this long, so short words are never credential material. */
+  minLength: 8,
+  /** No whitespace anywhere in the value. */
+  noWhitespace: /\s/,
+  /** At least one non-alphabetic symbol, so a plain word is never enough. */
+  symbolClass: /[^A-Za-z]/,
+  /** The shape of a credential rather than a word or a number: mixed case… */
+  lowerAndUpper: Object.freeze([/[a-z]/, /[A-Z]/] as const),
+  /** …or a letter adjacent to a digit (`31536000x`, `a1b2c3d4`, `deadbeef1`). */
+  letterAndDigit: Object.freeze([/[A-Za-z]/, /[0-9]/] as const),
+});
+
+/**
+ * Is `value` shaped like credential material (rather than an ordinary word or
+ * number that happened to follow a `password=`/`max-age=` marker)? See
+ * {@link ASSIGNMENT_VALUE_KIND}.
+ */
+function isCredentialAssignmentValue(value: string): boolean {
+  if (value.length < ASSIGNMENT_VALUE_KIND.minLength) return false;
+  if (ASSIGNMENT_VALUE_KIND.noWhitespace.test(value)) return false;
+  if (!ASSIGNMENT_VALUE_KIND.symbolClass.test(value)) return false;
+  const mixedCase = ASSIGNMENT_VALUE_KIND.lowerAndUpper.every((test) => test.test(value));
+  const digitBesideLetter = ASSIGNMENT_VALUE_KIND.letterAndDigit.every((test) => test.test(value));
+  return mixedCase || digitBesideLetter;
+}
+
+/**
  * The known-format list. Ordered most-specific first purely for readable
  * reports; every entry is a full-shape match, so order does not affect which
  * fire.
@@ -313,6 +476,20 @@ const KNOWN_SECRET_FORMATS: readonly KnownSecretFormat[] = Object.freeze([
     name: "json-web-token",
     // Three base64url segments, each of non-trivial length.
     pattern: /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/,
+  },
+  {
+    name: "connection-string-credentials",
+    // `scheme://user:password@host` — see {@link DSN_URL_PATTERN}. The password
+    // class excludes `/` and `?`, so a port (`@`-less `host:5432`) or the colon
+    // of a path never reaches the `@host` anchor.
+    pattern: DSN_URL_PATTERN,
+  },
+  {
+    name: "credential-assignment",
+    // `password=…` / `secret: …` in an assignment — see {@link ASSIGNMENT_PATTERN}.
+    // The value-shape guard runs separately, in {@link scanSource}, because a
+    // regex cannot tell a credential from a word.
+    pattern: ASSIGNMENT_PATTERN,
   },
 ]);
 
@@ -526,15 +703,27 @@ export function scanSource(path: string, source: string): readonly SecretFinding
   for (const literal of literals) {
     for (const format of KNOWN_SECRET_FORMATS) {
       const match = format.pattern.exec(literal.value);
-      if (match !== null) {
-        findings.push({
-          path,
-          line: literal.line,
-          rule: format.name,
-          preview: previewOf(match[0]),
-        });
+      if (match === null) continue;
+      // The assignment rule carries one precision guard a regex cannot express:
+      // the value must read as credential material, not an ordinary word or a
+      // number after a `password=`/`max-age=` marker. (The key side is guarded by
+      // the pattern's own `[^A-Za-z0-9]` boundary — `asecret=` and `max-age=` do
+      // not match — and the bare-marker case by the empty value never passing
+      // the length check.) The pattern itself stays a pure *shape*.
+      if (format.name === "credential-assignment") {
+        if (!isCredentialAssignmentValue(match[2])) continue;
       }
+      findings.push({
+        path,
+        line: literal.line,
+        rule: format.name,
+        preview: previewOf(match[0]),
+      });
     }
+    // A credential in a query string or config line — `?password=…`,
+    // `&secret=…`, `db_secret=…` — is caught by the same assignment rule: the
+    // `[^A-Za-z0-9]` guard treats `?`, `&` and `_` as key boundaries, so the key
+    // reads as the whole word and the two value guards above apply unchanged.
     if (isHighEntropyBlob(literal.value)) {
       findings.push({
         path,

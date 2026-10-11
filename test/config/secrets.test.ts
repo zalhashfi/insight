@@ -32,12 +32,15 @@ import { dirOf, filePathFromUrl, joinPath, readDirectorySync, readTextFileSync }
  *
  *   * **Refuse** (`scanForHardcodedSecrets`) is the guard. It is a pure
  *     function over `(path, source)` pairs, so it is proven here over hand-built
- *     inputs — a known credential format, a known-format *marker with no tail*
- *     (which must NOT fire), a raw high-entropy blob, and the repo's own
- *     fixtures (`"sess_owner_aaaa…"`, a base64url alphabet declaration) which
- *     must NOT fire either. The final `describe` runs the very same function
- *     over the **real source tree**, which is the acceptance test: if a secret
- *     literal ever lands in `worker/src` or `web/src`, this file goes red.
+ *     inputs — a known credential format, a connection string
+ *     (`postgresql://user:pass@host/db`), `password=`/`secret=` assignments, a
+ *     known-format *marker with no tail* (which must NOT fire), a credential-free
+ *     URL (which must NOT fire), a raw high-entropy blob, and the repo's own
+ *     fixtures (`"sess_owner_aaaa…"`, the `SECRET_VALUE_MARKERS` list, a
+ *     base64url alphabet declaration) which must NOT fire either. The final
+ *     `describe` runs the very same function over the **real source tree**, which
+ *     is the acceptance test: if a secret literal ever lands in `worker/src` or
+ *     `web/src`, this file goes red.
  *
  * The "a hardcoded literal → the scan FAILS" half is proven end-to-end in
  * {@link describe} "the scan catches a planted marker": a planted secret is
@@ -157,6 +160,15 @@ describe("scanSource — known credential formats", () => {
     expect(findings).toEqual([]);
   });
 
+  it("does NOT fire on the REAL `SECRET_VALUE_MARKERS` literal (esp. password= / secret=)", () => {
+    // The full list `worker/src/mcp/tools.ts` ships. Four of its eight entries —
+    // `password=`, `secret=`, `token=`, `Bearer ` — are exactly the shapes the
+    // new assignment rule looks for, and every one is a BARE marker with an
+    // empty (or non-credential) value, so none may fire.
+    const source = `const SECRET_VALUE_MARKERS = ["sk_live_", "sk_test_", "AKIA", "-----BEGIN", "password=", "secret=", "token=", "Bearer "];`;
+    expect(scanSource("a.ts", source)).toEqual([]);
+  });
+
   it("does NOT fire on prose or identifiers in a comment or string", () => {
     const findings = scanSource(
       "a.ts",
@@ -174,6 +186,141 @@ describe("scanSource — known credential formats", () => {
     const findings = scanSource("a.ts", `const k = "AKIAIOSFODNN7EXAMPLE";`);
     expect(findings[0].preview.length).toBeLessThan("AKIAIOSFODNN7EXAMPLE".length);
     expect(findings[0].preview.startsWith("AKIA")).toBe(true);
+  });
+});
+
+describe("scanSource — connection-string credentials (scheme://user:password@host)", () => {
+  it("catches a Postgres DSN in a source string", () => {
+    const findings = scanSource("a.ts", `const DATABASE_URL = "postgresql://user:pass@host/db";`);
+    expect(findings.map((f) => f.rule)).toContain("connection-string-credentials");
+    expect(findings[0].line).toBe(1);
+  });
+
+  it("catches the other userinfo-bearing back-end schemes", () => {
+    for (const dsn of [
+      "postgres://app:s3cr3tP4ss@db.internal:5432/prod",
+      "redis://default:s3cr3tP4ss@cache.internal:6379",
+      "mongodb+srv://svc:s3cr3tP4ss@cluster.example.net/db",
+      "amqps://broker:s3cr3tP4ss@mq.internal:5671",
+      // A webhook/bot URL is a credential in its own right.
+      "slack://token:s3cr3tP4ss@channel",
+      "smtp://mailer:s3cr3tP4ss@smtp.internal:587",
+    ]) {
+      const findings = scanSource("a.ts", `const c = "${dsn}";`);
+      expect(findings.map((f) => f.rule)).toContain("connection-string-credentials");
+    }
+  });
+
+  it("does NOT fire on a credential-free URL (a location, not a secret)", () => {
+    for (const url of [
+      "https://example.test/path",
+      "http://collector.local/ingest",
+      "https://hooks.slack.com/services/T/B/m4-secret-webhook",
+      "https://hooks.example/abc",
+      "wss://insight.example/socket",
+    ]) {
+      expect(scanSource("a.ts", `const u = "${url}";`)).toEqual([]);
+    }
+  });
+
+  it("does NOT fire on a URL that only has a port or a path colon", () => {
+    // `5432` is a port; `a:b` is a path segment — neither is `user:password@`.
+    expect(scanSource("a.ts", `const u = "postgres://db.internal:5432/prod";`)).toEqual([]);
+    expect(scanSource("a.ts", `const u = "postgres://db.internal/a:b";`)).toEqual([]);
+  });
+
+  it("does NOT fire on a URL with a lone `user@` (no password)", () => {
+    expect(scanSource("a.ts", `const u = "postgres://user@db.internal/prod";`)).toEqual([]);
+  });
+
+  it("reports the DSN rule by name", () => {
+    const findings = scanSource(
+      "a.ts",
+      'const a = 1;\nconst u = "postgresql://user:pass@host/db";',
+    );
+    expect(findings[0].rule).toBe("connection-string-credentials");
+    expect(findings[0].line).toBe(2);
+  });
+});
+
+describe("scanSource — password= / secret= assignment shapes", () => {
+  it("catches a credential assignment in a string literal", () => {
+    for (const source of [
+      `const s = "password=Sup3rSecret123";`,
+      `const s = "secret=aB3xY7kL9mN2pQ";`,
+      `const s = "pwd=Sup3rSecret123";`,
+      `const s = "apikey=aB3xY7kL9mN2pQ";`,
+      `const s = "db_secret=aB3xY7kL9mN2pQ";`,
+      `const s = "client_secret=aB3xY7kL9mN2pQ";`,
+    ]) {
+      const findings = scanSource("a.ts", source);
+      expect(findings.length).toBeGreaterThan(0);
+    }
+  });
+
+  it("catches a credential embedded in a URL query / config line", () => {
+    // `?`/`&` is a delimiter, not part of the key: the same assignment rule
+    // catches the query form, keyed on the whole word.
+    const findings = scanSource(
+      "a.ts",
+      `const url = "https://api.example.test/v1?user=svc&pwd=Sup3rSecret123";`,
+    );
+    expect(findings.map((f) => f.rule)).toContain("credential-assignment");
+  });
+
+  it("catches a whole-word key=value in a query string", () => {
+    const findings = scanSource(
+      "a.ts",
+      `const url = "https://api.example.test/v1?password=Sup3rSecret123";`,
+    );
+    expect(findings.map((f) => f.rule)).toContain("credential-assignment");
+  });
+
+  it("does NOT fire on a bare marker constant (`password=` with no value)", () => {
+    expect(scanSource("a.ts", `const M = "password=";`)).toEqual([]);
+    expect(scanSource("a.ts", `const M = "secret=";`)).toEqual([]);
+  });
+
+  it("does NOT fire on the HSTS header value (`max-age=31536000`)", () => {
+    // A numeric-only value is not credential material, and `max-age` is no key.
+    const findings = scanSource(
+      "a.ts",
+      `export const HSTS = "max-age=31536000; includeSubDomains";`,
+    );
+    expect(findings).toEqual([]);
+  });
+
+  it("does NOT fire on a SQL assignment inside a schema literal (`status='pending'`)", () => {
+    // The tree's own `SCHEDULER_DDL` carries `SET status='pending'` lines; the
+    // key is not a credential word and the value is an all-lowercase enum.
+    const findings = scanSource(
+      "a.ts",
+      "const DDL = `UPDATE t SET status='claimed' WHERE id=? AND status='pending'`;",
+    );
+    expect(findings).toEqual([]);
+  });
+
+  it("does NOT fire on an identifier that merely contains a key word", () => {
+    // `user_secret_pointer` / `application/json` are not `secret=<value>`.
+    const findings = scanSource(
+      "a.ts",
+      'const a = "user_secret_pointer"; const b = "application/json";',
+    );
+    expect(findings).toEqual([]);
+  });
+
+  it("does NOT fire on a comment separator (a run of `-` characters)", () => {
+    const findings = scanSource("a.ts", "const DDL = `-- ------------------------`;");
+    expect(findings).toEqual([]);
+  });
+
+  it("does NOT fire on prose that merely mentions password=", () => {
+    // The run after `password=` is the rest of a sentence: whitespace-broken.
+    const findings = scanSource(
+      "a.ts",
+      'const doc = "set password= to rotate the credential";',
+    );
+    expect(findings).toEqual([]);
   });
 });
 
@@ -292,6 +439,27 @@ describe("the scan catches a planted marker (and leaves the tree clean)", () => 
       { path: "a.ts", content: 'const k = "AKIAIOSFODNN7EXAMPLE";\n' },
     ];
     expect(scanForHardcodedSecrets(files).map((f) => f.path)).toEqual(["a.ts", "z.ts"]);
+  });
+
+  it("finds a planted connection string via the same scanner the tree scan uses", () => {
+    // The new rule is load-bearing over the real walk: a DSN planted in an
+    // isolated pseudo-file is found, with the right rule name.
+    const planted: ScannableFile = {
+      path: "<planted>/db-config.ts",
+      content: `export const DATABASE_URL = "postgresql://user:pass@host/db";\n`,
+    };
+    const findings = scanForHardcodedSecrets([planted]);
+    expect(findings.map((f) => f.rule)).toContain("connection-string-credentials");
+    expect(findings[0].path).toBe("<planted>/db-config.ts");
+  });
+
+  it("finds a planted password= assignment via the same scanner", () => {
+    const planted: ScannableFile = {
+      path: "<planted>/db-config.ts",
+      content: `export const LINE = "password=Sup3rSecret123";\n`,
+    };
+    const findings = scanForHardcodedSecrets([planted]);
+    expect(findings.map((f) => f.rule)).toContain("credential-assignment");
   });
 });
 
