@@ -27,6 +27,7 @@ import {
   type TelemetryDeps,
 } from "../../worker/src/domains/telemetry/telemetry";
 import { postTelemetryValidated } from "../../worker/src/domains/telemetry/validate-route";
+import { AUTHORIZATION_HEADER } from "../../worker/src/domains/telemetry/query";
 import { DEFAULT_LIMITS } from "../../worker/src/shared/validation";
 import {
   CONTRACT_ERRORS,
@@ -199,6 +200,18 @@ describe("contract-lock self-consistency", () => {
     expect(GET_OTA.implemented).toBe(false); // M3 / A18
     expect(GET_CONTROL.implemented).toBe(false);
     expect(POST_CONTROL_ACK.implemented).toBe(false);
+  });
+
+  it("pins the authorization header to the lock's lowercase spelling (SDK drift regression)", () => {
+    // The SDK mirror once shipped `Authorization` (capital A) while the lock
+    // says `authorization`. HTTP header names are case-insensitive, so nothing
+    // on the wire caught it — only `mirror.test.ts`, which parses the SDK's
+    // C++ constants and compares byte-for-byte, does. This asserts the lock
+    // side of that pair and names the value the SDK must match.
+    expect(CONTRACT_HEADERS.authorization).toBe("authorization");
+    expect(CONTRACT_HEADERS.authorization).not.toBe("Authorization");
+    // The server reads this name; keep it in step with the lock.
+    expect(AUTHORIZATION_HEADER).toBe(CONTRACT_HEADERS.authorization);
   });
 });
 
